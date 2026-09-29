@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "excel-mcp-server"
+version = "1.0.0"
+description = "Model Context Protocol (MCP) server for Microsoft Excel automation and headless spreadsheet manipulation."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Excel MCP Contributors" }
+]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "excel",
+    "spreadsheet",
+    "openpyxl",
+    "pywin32",
+    "office-automation",
+    "ai-agent"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Office/Business :: Financial :: Spreadsheet",
+    "Topic :: Software Development :: Libraries :: Python Modules"
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "openpyxl>=3.1.2",
+    "pywin32>=306; sys_platform == 'win32'"
+]
+
+[project.scripts]
+excel-mcp = "excel_mcp_server:main"
+
+[project.urls]
+Homepage = "https://github.com/example/excel-mcp-server"
+Repository = "https://github.com/example/excel-mcp-server.git"
+Issues = "https://github.com/example/excel-mcp-server/issues"

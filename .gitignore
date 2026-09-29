@@ -1,0 +1,51 @@
+# ==========================================
+# Global Git Ignore for MCP Suite Monorepo
+# ==========================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Microsoft Office temporary & lock files
+~$*.docx
+~$*.xlsx
+~$*.xlsm
+~$*.xls
+~$*.pptx
+*.tmp
+
+# Test artifacts and outputs
+test_mcp_output.*
+temp_*
+*.log
+
+# 3D / CAD backup and autosave files
+*.blend1
+*.blend@
+*.FCStd#
+*.FCStd1
+*.FCStd.bak
+*.bak
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+.pytest_cache/
