@@ -1,10 +1,13 @@
-# ⚡ MCP Suite
+# MCP Suite
 
 <h3 align="center">Modern, Production-Ready MCP Servers for Office Automation, 3D Graphics & Engineering CAD.</h3>
 
 <p align="center">
 Empower AI assistants (Claude Desktop, Google Antigravity, Cursor, VS Code) to automate Word, Excel, PowerPoint, FreeCAD, and Blender seamlessly with over 95 high-level tools.
 </p>
+
+<img width="1280" height="720" alt="MCP" src="https://github.com/user-attachments/assets/225d7a3a-9e8e-48bb-8d2f-946a3638874b" />
+
 
 ## Overview
 
