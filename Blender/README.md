@@ -1,10 +1,13 @@
-# 🎨 Blender MCP
+# Blender MCP
 
 <h3 align="center">Real-Time 3D Scene Generation, PBR Materials, Asset Importing & Automated Rendering.</h3>
 
 <p align="center">
 Empower LLMs and AI agents (Claude Desktop, Cursor, Antigravity, VS Code) to interact with Blender 3D in real time through natural language.
 </p>
+
+<img width="1800" height="550" alt="blender" src="https://github.com/user-attachments/assets/8c67abae-9e92-4d71-96cf-e182f1885b9b" />
+
 
 ## Overview
 
