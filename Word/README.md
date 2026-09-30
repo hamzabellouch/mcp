@@ -1,10 +1,13 @@
-# 📝 Word MCP
+# Word MCP
 
 <h3 align="center">Enterprise-Grade Document Generation, Live COM Automation & Headless Processing.</h3>
 
 <p align="center">
 Empower LLMs and AI agents to create, format, and manipulate Microsoft Word documents with full RTL/Arabic support and PDF export.
 </p>
+
+<img width="1200" height="628" alt="word" src="https://github.com/user-attachments/assets/6793f026-88a9-4c6c-9ce1-960cbe183a37" />
+
 
 ## Overview
 
