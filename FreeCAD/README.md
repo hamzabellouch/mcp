@@ -1,10 +1,13 @@
-# 📐 FreeCAD MCP
+# FreeCAD MCP
 
 <h3 align="center">Modern, High-Performance FreeCAD Automation, Parametric 3D CAD, FEM Simulation & Technical Drawing MCP Server.</h3>
 
 <p align="center">
 Connect AI assistants directly to FreeCAD for automated parametric 3D modeling, technical drawings (TechDraw), finite element analysis (FEM), live viewport screenshots, and background code execution.
 </p>
+
+<img width="1280" height="640" alt="FreeCAD" src="https://github.com/user-attachments/assets/b29b8c58-045f-482b-9974-341e0a1d04e2" />
+
 
 ## Overview
 
