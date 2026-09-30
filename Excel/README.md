@@ -1,10 +1,13 @@
-# 📊 Excel MCP
+# Excel MCP
 
 <h3 align="center">Dual-Engine Spreadsheet Automation, Statistical Data Profiling & Interactive Charting.</h3>
 
 <p align="center">
 Empower AI assistants (Claude Desktop, Cursor, Antigravity, VS Code, Cline) to read, write, format, analyze spreadsheets, and generate formulas and charts across Windows, macOS, and Linux.
 </p>
+
+<img width="1200" height="628" alt="excel" src="https://github.com/user-attachments/assets/d4373083-9018-4643-b1f7-94c353513d72" />
+
 
 ## Overview
 
