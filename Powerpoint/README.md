@@ -1,10 +1,13 @@
-# 📊 PowerPoint MCP
+# PowerPoint MCP
 
 <h3 align="center">High-Performance Presentation Automation, Dynamic Slide Generation & KPI Visualization.</h3>
 
 <p align="center">
 Create executive slide decks, native charts, KPI metric cards, timelines, and high-resolution PDF/PNG exports directly via natural language.
 </p>
+
+<img width="1200" height="628" alt="powerpoint" src="https://github.com/user-attachments/assets/b312cfd1-a7a8-4c72-92a8-462b5ec7ec71" />
+
 
 ## Overview
 
