@@ -2,53 +2,96 @@
 # Global Git Ignore for MCP Suite Monorepo
 # ==========================================
 
-# Byte-compiled / optimized / DLL files
+# --- Python & Virtual Environments ---
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
 *.so
 .Python
+.venv/
+venv/
+env/
+ENV/
+.env
 
-# Distribution / packaging
+# --- Distribution & Packaging ---
 build/
 dist/
 *.egg-info/
+*.egg
+eggs/
 .eggs/
 
-# Virtual Environments
-venv/
-.venv/
-env/
-ENV/
+# --- Testing, Coverage & Logs ---
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
 
-# Microsoft Office temporary & lock files
+# --- IDEs & Text Editors ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Operating System Artifacts ---
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+desktop.ini
+Desktop.ini
+.Spotlight-V100
+.Trashes
+
+# --- Generic Temporary & Test Outputs ---
+*.tmp
+temp_*
+output_*
+test_mcp_output.*
+
+# --- Microsoft Word MCP ---
+*.docx
+*.doc
 ~$*.docx
+~$*.doc
+
+# --- Microsoft Excel MCP ---
+*.xlsx
+*.xlsm
+*.xls
 ~$*.xlsx
 ~$*.xlsm
 ~$*.xls
-~$*.pptx
-*.tmp
+~$*.csv
 
-# Test artifacts and outputs
-test_mcp_output.*
-temp_*
-*.log
-*.docx
+# --- Microsoft PowerPoint MCP ---
+*.pptx
+*.ppt
+*.potx
+preview_images/
+~$*.pptx
+~$*.ppt
+
+# General Office lock file pattern
+~$*
+
+# --- Generated PDF Exports ---
+*.pdf
+
+# --- FreeCAD MCP ---
 *.FCStd
+*.FCStd#
+*.FCStd[0-9]*
+*.FCBak
+*.FCMat
 Projects/
 
-# 3D / CAD backup and autosave files
-*.blend1
+# --- Blender MCP ---
+*.blend
+*.blend[0-9]*
 *.blend@
-*.FCStd#
-*.FCStd1
-*.FCStd.bak
-*.bak
-
-# OS and IDE files
-.DS_Store
-Thumbs.db
-desktop.ini
-.vscode/
-.idea/
-.pytest_cache/
+mcp_render_*.png
+mcp_model_*

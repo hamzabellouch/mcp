@@ -11,8 +11,8 @@ import asyncio
 import unittest
 import tempfile
 
-# Ensure project root is in sys.path
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+# Ensure FreeCAD project root is in sys.path
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "FreeCAD"))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -229,7 +229,6 @@ print("CAD_PIPELINE_COMPLETE")
 
     def test_open_save_document_tools(self):
         """Verify freecad_open_document and freecad_save_document behavior."""
-        # Test nonexistent file handling
         res_nonexistent = freecad_mcp_server.freecad_open_document("nonexistent_model_file.FCStd")
         self.assertIsInstance(res_nonexistent, list)
         text_nonexistent = res_nonexistent[0].text
@@ -238,7 +237,6 @@ print("CAD_PIPELINE_COMPLETE")
             f"Unexpected response: {text_nonexistent}"
         )
 
-        # Test save handling when no document is active
         res_save = freecad_mcp_server.freecad_save_document(document_name="NonexistentDoc")
         self.assertIsInstance(res_save, list)
         text_save = res_save[0].text
@@ -253,13 +251,11 @@ print("CAD_PIPELINE_COMPLETE")
             def __init__(self, headers):
                 self.headers = headers
         
-        # Request with Origin header should be rejected
         handler_with_origin = FakeHandler({"Origin": "https://malicious-site.com", "Host": "127.0.0.1:9877"})
         rejection = FreeCADBridgeHTTPHandler._verify_request(handler_with_origin)
         self.assertIsNotNone(rejection)
         self.assertEqual(rejection[0], 403)
         
-        # Request with DNS rebinding host should be rejected
         handler_with_bad_host = FakeHandler({"Host": "evil-domain.com:9877"})
         rejection_host = FreeCADBridgeHTTPHandler._verify_request(handler_with_bad_host)
         self.assertIsNotNone(rejection_host)

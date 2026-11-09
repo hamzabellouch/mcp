@@ -180,13 +180,6 @@ Once connected, you can prompt your AI assistant naturally:
 * *"Import the 3D model from `https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Box/glTF-Binary/Box.glb` and place it at location [0, 0, 1]."*
 * *"Set camera resolution to 1920x1080 and render the active view to `render_preview.png`."*
 
-## 🖼️ Gallery Preview
-
-<div align="center">
-  <img src="assets/render_preview.png" alt="Blender MCP Render Preview" width="700"/>
-  <p><i>Example output generated and rendered directly in Blender via natural language MCP instructions.</i></p>
-</div>
-
 > [!WARNING]
 > Automated 3D scene modifications and script execution can alter local Blender files. There is always a possibility of error, so we assume no responsibility for any inaccuracies.
 

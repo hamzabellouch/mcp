@@ -14,6 +14,11 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
+# Ensure Word project directory is in sys.path
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Word"))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 # The script tool is only registered when explicitly enabled; enable it for this run.
 os.environ.setdefault("WORD_MCP_ENABLE_SCRIPT", "1")
 
@@ -37,10 +42,10 @@ for _name in dir(srv):
     if _name.startswith("word_") and callable(getattr(srv, _name)):
         setattr(srv, _name, _record_failures(getattr(srv, _name)))
 
-TEST_FILE = os.path.abspath("temp_enterprise_output.docx")
-TEST_TEMPLATE = os.path.abspath("temp_template.docx")
-TEST_FILLED = os.path.abspath("temp_filled.docx")
-TEST_PDF = os.path.abspath("temp_enterprise_output.pdf")
+TEST_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "temp_enterprise_output.docx"))
+TEST_TEMPLATE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "temp_template.docx"))
+TEST_FILLED = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "temp_filled.docx"))
+TEST_PDF = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "temp_enterprise_output.pdf"))
 
 
 def run_tests():
@@ -235,7 +240,6 @@ print(f"Document inspection complete: {len(doc.paragraphs)} paragraphs, {len(doc
             except Exception:
                 pass
 
-    # PDF export needs a real Word (COM); it is expected to fail elsewhere.
     expected = set() if sys.platform == "win32" else {"word_export_pdf"}
     real_failures = [(n, o) for n, o in FAILURES if n not in expected]
 

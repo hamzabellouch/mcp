@@ -11,6 +11,11 @@ import tempfile
 import json
 from unittest.mock import patch, MagicMock
 
+# Ensure Blender project directory is in sys.path
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Blender"))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import blender_mcp_server
 from blender_mcp_server import (
     mcp,
@@ -145,7 +150,6 @@ class TestBlenderMCPMockedOnline(unittest.TestCase):
         blender_create_primitive("cube", name=name_with_quotes)
         
         sent_code = mock_send.call_args[1]["payload"]["code"]
-        # Code should compile without syntax errors
         compiled = compile(sent_code, "<test>", "exec")
         self.assertIsNotNone(compiled)
 
@@ -164,7 +168,6 @@ class TestBlenderMCPMockedOnline(unittest.TestCase):
         )
         self.assertTrue(mock_send.called)
         sent_code = mock_send.call_args[1]["payload"]["code"]
-        # Verify valid Python syntax despite quotes
         compiled = compile(sent_code, "<test_mat>", "exec")
         self.assertIsNotNone(compiled)
         self.assertIn("BSDF_PRINCIPLED", sent_code)

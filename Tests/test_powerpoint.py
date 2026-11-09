@@ -15,16 +15,21 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
+# Ensure Powerpoint project directory is in sys.path
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Powerpoint"))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import powerpoint_mcp_server as srv
 from powerpoint_engine import COM_AVAILABLE
 
-TEST_FILE = os.path.abspath("temp_enterprise_pitch.pptx")
-TEST_SAVED_AS = os.path.abspath("temp_saved_as.pptx")
-TEST_TEMPLATE = os.path.abspath("temp_template.pptx")
-TEST_FILLED = os.path.abspath("temp_filled.pptx")
-TEST_PDF = os.path.abspath("temp_enterprise_pitch.pdf")
-TEST_IMG_DIR = os.path.abspath("temp_slide_images")
-TEST_LOCAL_IMG = os.path.abspath("temp_sample_chart.png")
+TEST_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "temp_enterprise_pitch.pptx"))
+TEST_SAVED_AS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "temp_saved_as.pptx"))
+TEST_TEMPLATE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "temp_template.pptx"))
+TEST_FILLED = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "temp_filled.pptx"))
+TEST_PDF = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "temp_enterprise_pitch.pdf"))
+TEST_IMG_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "temp_slide_images"))
+TEST_LOCAL_IMG = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "temp_sample_chart.png"))
 
 
 def create_sample_image(path: str):

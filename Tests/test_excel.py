@@ -14,10 +14,15 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
+# Ensure Excel project directory is in sys.path
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Excel"))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import excel_mcp_servers as srv
 
-TEST_FILE = os.path.abspath("test_mcp_output.xlsx")
-TEST_PDF = os.path.abspath("test_mcp_output.pdf")
+TEST_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "test_mcp_output.xlsx"))
+TEST_PDF = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "test_mcp_output.pdf"))
 
 
 def run_tests():
@@ -153,8 +158,16 @@ for s in wb_obj.sheetnames:
     print("Script Output:\n", script_out)
 
     print("\n========================================")
-    print(f"🎉 ALL TESTS PASSED! Output file: {TEST_FILE}")
+    print("🎉 ALL TESTS PASSED!")
     print("========================================")
+
+    # Cleanup temporary output files
+    for f in [TEST_FILE, TEST_PDF]:
+        if os.path.exists(f):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
