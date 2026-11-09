@@ -14,7 +14,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
-import excel_mcp_server as srv
+import excel_mcp_servers as srv
 
 TEST_FILE = os.path.abspath("test_mcp_output.xlsx")
 TEST_PDF = os.path.abspath("test_mcp_output.pdf")

@@ -220,6 +220,20 @@ python freecad_mcp_server.py --host 127.0.0.1 --port 9875
 - `get_async_status(job_id)`: Inspect async background jobs, execution states, and error traces.
 - `execute_code_headless(code, timeout)`: Run Python scripts in an isolated `FreeCADCmd` subprocess with native crash detection.
 
+## 🎬 Visual Step-by-Step Construction Protocol
+
+All AI assistants connected to FreeCAD MCP must follow the **Interactive Step-by-Step Construction & Animation Rule**:
+
+1. **Progressive 4-Stage Modeling**:
+   - **Stage 1 (2D Wireframe & Points)**: Construct wireframes and reference contours edge-by-edge, refreshing the viewport so users see the 2D layout in 3D space.
+   - **Stage 2 (2D Face Formation)**: Form closed planar faces.
+   - **Stage 3 (3D Volumetric Extrusion)**: Extrude or revolve faces into 3D solids.
+   - **Stage 4 (Finishing & Styling)**: Apply fillets, boolean operations, colors, and transparencies.
+2. **Paced Execution & Live Animation**:
+   - In multi-step Python scripts, utilize `FreeCADGui.updateGui()` and brief pacing delays (`time.sleep(0.1)` to `0.2`) between primitives so the user observes the creation live like an interactive animation.
+3. **Dynamic Mechanisms**:
+   - For moving components (rotors, gears, spinning stars), attach non-blocking `QtCore.QTimer` loops at 30-40 FPS.
+
 ## 🔒 Thread Safety & Best Practices
 
 > [!WARNING]

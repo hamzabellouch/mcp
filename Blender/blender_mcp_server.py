@@ -32,7 +32,8 @@ BLENDER_BRIDGE_URL = os.environ.get("BLENDER_BRIDGE_URL", "http://127.0.0.1:9876
 def _send_request(endpoint: str, method: str = "GET", payload: Optional[dict] = None, timeout: float = 20.0) -> dict:
     """Helper to send requests to Blender Bridge with error handling."""
     url = f"{BLENDER_BRIDGE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
-    headers = {"Host": "127.0.0.1:9876"}
+    parsed_bridge = urllib.parse.urlparse(BLENDER_BRIDGE_URL)
+    headers = {"Host": parsed_bridge.netloc if parsed_bridge.netloc else "127.0.0.1:9876"}
     try:
         if method == "GET":
             response = requests.get(url, headers=headers, timeout=timeout)
@@ -327,7 +328,10 @@ def blender_import_3d_model(
         try:
             parsed = urllib.parse.urlparse(local_path)
             raw_filename = os.path.basename(parsed.path) or "downloaded_model.glb"
-            clean_filename = "".join(c for c in raw_filename if c.isalnum() or c in "._-")
+            orig_ext = pathlib.Path(raw_filename).suffix.lower() or ".glb"
+            clean_filename = "".join(c for c in raw_filename if c.isalnum() or c in "._-").strip("._")
+            if not clean_filename or not pathlib.Path(clean_filename).suffix:
+                clean_filename = f"model{orig_ext}"
             temp_dir = tempfile.gettempdir()
             target_dest = os.path.join(temp_dir, f"mcp_model_{int(time.time())}_{clean_filename}")
             

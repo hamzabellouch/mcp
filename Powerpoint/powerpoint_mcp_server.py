@@ -16,10 +16,10 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 try:
-    from mcp.server.mcpserver import MCPServer as FastMCP
+    from mcp.server.fastmcp import FastMCP
 except Exception:
     try:
-        from mcp.server.fastmcp import FastMCP
+        from mcp.server.mcpserver import MCPServer as FastMCP
     except Exception:
         from mcp.server import MCPServer as FastMCP
 

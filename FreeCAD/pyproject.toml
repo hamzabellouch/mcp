@@ -61,9 +61,5 @@ Documentation = "https://github.com/freecad/freecad-mcp/blob/main/README.md"
 
 [tool.setuptools]
 py-modules = [
-    "freecad_mcp_server",
-    "freecad_client",
-    "freecad_engine",
-    "freecad_headless",
-    "freecad_macro_bridge"
+    "freecad_mcp_server"
 ]

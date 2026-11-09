@@ -81,8 +81,11 @@ def is_arabic_text(text: str) -> bool:
 
 
 def cleanup_stale_lock_files(target_path: Optional[str] = None):
-    """Remove orphaned Microsoft PowerPoint ~$*.pptx hidden lock files to prevent 'File In Use' dialogs."""
+    """Remove orphaned Microsoft PowerPoint ~$*.pptx hidden lock files when PowerPoint is not actively running."""
     try:
+        # Never touch lock files if PowerPoint is currently running to prevent corruption
+        if COM_AVAILABLE and LivePowerPointSession.is_running():
+            return
         if target_path:
             dir_path = os.path.dirname(os.path.abspath(target_path)) if (os.path.isfile(target_path) or '.' in os.path.basename(target_path)) else os.path.abspath(target_path)
         else:
@@ -2216,19 +2219,16 @@ class PowerPointEngine:
             "sys": sys
         }
 
+        import contextlib
         has_error = False
         try:
-            sys.stdout = stdout_buf
-            sys.stderr = stderr_buf
-            exec(code, globals(), local_env)
+            with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+                exec(code, globals(), local_env)
             if prs and target_path:
                 save_pptx_safely(prs, target_path)
         except Exception:
             has_error = True
             stderr_buf.write(traceback.format_exc())
-        finally:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
 
         stderr_val = stderr_buf.getvalue()
         is_error = has_error or (bool(stderr_val.strip()) and ("Traceback" in stderr_val or "Error" in stderr_val or "Exception" in stderr_val))

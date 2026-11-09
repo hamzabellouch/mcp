@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "word-mcp-server"
-version = "1.0.0"
+version = "1.1.0"
 description = "Model Context Protocol (MCP) Server for Microsoft Word automation and document processing."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -45,8 +45,14 @@ dependencies = [
     "pillow>=10.0.0"
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
 [project.scripts]
 word-mcp = "word_mcp_server:main"
 
 [tool.setuptools]
-py-modules = ["word_mcp_server", "word_engine"]
+py-modules = ["word_mcp_server", "word_engine", "com_runtime"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,17 +1,27 @@
 """
-Excel Automation Engine
------------------------
-Provides high-level abstraction for interacting with Microsoft Excel.
-Supports:
-1. Live Windows COM Automation (via pywin32) for interactive real-time control of Excel application.
-2. Headless OpenPyXL engine for direct, file-based manipulation without requiring Excel to be running.
+Excel MCP Server (Unified Edition)
+---------------------------------
+Model Context Protocol (MCP) server providing high-level tools to interact with Microsoft Excel.
+Supports live desktop Excel automation (via Windows COM/pywin32) and headless file manipulation (via openpyxl).
+Consolidated into a single portable script.
 """
 
+from __future__ import annotations
+
 import os
+import sys
 import json
 import math
 import datetime
+import re
+import subprocess
+import threading
+import queue
+import time
+import logging
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 from typing import List, Dict, Any, Optional, Union, Tuple
+
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter, column_index_from_string
@@ -20,9 +30,190 @@ from openpyxl.chart import BarChart, LineChart, PieChart, AreaChart, Reference
 try:
     import win32com.client
     import pythoncom
+    import pywintypes
     COM_AVAILABLE = True
 except ImportError:
+    win32com = None
+    pythoncom = None
+    pywintypes = None
     COM_AVAILABLE = False
+
+try:
+    from mcp.server.fastmcp import FastMCP
+except Exception:
+    try:
+        from mcp.server.mcpserver import MCPServer as FastMCP
+    except Exception:
+        from mcp.server import MCPServer as FastMCP
+
+log = logging.getLogger("excel_mcp")
+
+
+# ----------------------------------------------------------------------
+# Exceptions
+# ----------------------------------------------------------------------
+class LiveExcelError(RuntimeError):
+    """A live (COM) operation failed. Callers must not fall back to file editing."""
+
+
+class ExcelNotRunning(RuntimeError):
+    """Excel is not running at all. Falling back to headless file editing is safe."""
+
+
+class ExcelNotReachable(LiveExcelError):
+    """An EXCEL.EXE process exists but COM cannot attach to it."""
+
+
+# ----------------------------------------------------------------------
+# Mode
+# ----------------------------------------------------------------------
+VALID_MODES = ("auto", "live", "headless")
+
+
+def get_mode() -> str:
+    """
+    auto     - use live Excel when it is running, otherwise edit files directly.
+    live     - COM only. Never touch files behind Excel's back.
+    headless - openpyxl only. COM is never used.
+    """
+    mode = os.environ.get("EXCEL_MCP_MODE", "auto").strip().lower()
+    return mode if mode in VALID_MODES else "auto"
+
+
+def script_execution_enabled() -> bool:
+    return os.environ.get("EXCEL_MCP_ENABLE_SCRIPT", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# ----------------------------------------------------------------------
+# COM apartment + retry
+# ----------------------------------------------------------------------
+_tls = threading.local()
+
+# 0x80010001 RPC_E_CALL_REJECTED, 0x8001010A RPC_E_SERVERCALL_RETRYLATER
+TRANSIENT_HRESULTS = {-2147418111, -2147417846}
+
+
+def ensure_com() -> None:
+    """Initialise desktop connection and COM once per thread (idempotent)."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            h_default = user32.OpenDesktopW("Default", 0, False, 0x01FF)
+            if h_default:
+                user32.SetThreadDesktop(h_default)
+        except Exception:
+            pass
+
+    if COM_AVAILABLE and not getattr(_tls, "initialised", False):
+        try:
+            pythoncom.CoInitialize()
+            _tls.initialised = True
+        except Exception:
+            pass
+
+
+def is_transient_com_error(exc: BaseException) -> bool:
+    if not COM_AVAILABLE or not isinstance(exc, pywintypes.com_error):
+        return False
+    return bool(exc.args) and exc.args[0] in TRANSIENT_HRESULTS
+
+
+def com_retry(fn: Callable[..., Any], *args: Any, tries: int = 8, delay: float = 0.25, **kwargs: Any) -> Any:
+    """Call fn and retry while Excel answers 'busy / call rejected'."""
+    for attempt in range(tries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            if attempt == tries - 1 or not is_transient_com_error(exc):
+                raise
+            time.sleep(min(delay * (1.5 ** attempt), 3.0))
+
+
+def excel_process_exists() -> bool:
+    """True if an EXCEL.EXE process exists, regardless of COM reachability."""
+    if sys.platform != "win32":
+        return False
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq EXCEL.EXE", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).stdout
+        return "excel.exe" in out.lower()
+    except Exception:
+        return False
+
+
+# ----------------------------------------------------------------------
+# Single-thread COM worker
+# ----------------------------------------------------------------------
+class ComWorker:
+    """
+    Executes COM jobs one at a time on a single dedicated STA thread.
+    """
+
+    def __init__(self, default_timeout: Optional[float] = None) -> None:
+        self._q: "queue.Queue[Optional[tuple]]" = queue.Queue()
+        self._thread: Optional[threading.Thread] = None
+        self._start_lock = threading.Lock()
+        if default_timeout is None:
+            try:
+                default_timeout = float(os.environ.get("EXCEL_MCP_TIMEOUT", "120"))
+            except ValueError:
+                default_timeout = 120.0
+        self.default_timeout = default_timeout
+
+    def _loop(self) -> None:
+        ensure_com()
+        try:
+            while True:
+                item = self._q.get()
+                if item is None:
+                    break
+                fut, fn, args, kwargs = item
+                if not fut.set_running_or_notify_cancel():
+                    continue
+                try:
+                    fut.set_result(fn(*args, **kwargs))
+                except BaseException as exc:
+                    fut.set_exception(exc)
+        finally:
+            if COM_AVAILABLE and getattr(_tls, "initialised", False):
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+                _tls.initialised = False
+
+    def _ensure_started(self) -> None:
+        with self._start_lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._loop, name="excel-com-worker", daemon=True)
+                self._thread.start()
+
+    def submit(self, fn: Callable[..., Any], *args: Any, _timeout: Optional[float] = None, **kwargs: Any) -> Any:
+        self._ensure_started()
+        fut: Future = Future()
+        self._q.put((fut, fn, args, kwargs))
+        timeout = self.default_timeout if _timeout is None else _timeout
+        try:
+            return fut.result(timeout=timeout)
+        except FutureTimeout as exc:
+            raise TimeoutError(
+                f"Excel did not finish within {timeout:.0f}s. A modal dialog may be open in Excel "
+                "(save prompt, formula error dialog, password). Close it and retry."
+            ) from exc
+
+    def shutdown(self) -> None:
+        if self._thread and self._thread.is_alive():
+            self._q.put(None)
+            self._thread.join(timeout=5)
+
+
+WORKER = ComWorker()
 
 
 # ==========================================
@@ -89,7 +280,7 @@ class LiveExcelSession:
     def get_app(create_if_missing: bool = False, visible: bool = True):
         if not COM_AVAILABLE:
             raise RuntimeError("pywin32 (win32com) is not available in this Python environment.")
-        pythoncom.CoInitialize()
+        ensure_com()
         try:
             app = win32com.client.GetActiveObject("Excel.Application")
             if visible and not app.Visible:
@@ -150,7 +341,7 @@ class ExcelEngine:
 
         if COM_AVAILABLE:
             try:
-                pythoncom.CoInitialize()
+                ensure_com()
                 app = win32com.client.GetActiveObject("Excel.Application")
                 status_info["excel_running"] = True
                 status_info["version"] = getattr(app, "Version", "Unknown")
@@ -195,7 +386,7 @@ class ExcelEngine:
         # If COM is available and either no filepath is given or user wants it visible in Excel:
         if COM_AVAILABLE and (filepath is None or visible):
             try:
-                pythoncom.CoInitialize()
+                ensure_com()
                 app = LiveExcelSession.get_app(create_if_missing=True, visible=visible)
                 wb = app.Workbooks.Add()
                 ws = wb.ActiveSheet
@@ -319,7 +510,7 @@ class ExcelEngine:
 
         if COM_AVAILABLE:
             try:
-                pythoncom.CoInitialize()
+                ensure_com()
                 app = LiveExcelSession.get_app(create_if_missing=True, visible=visible)
                 wb = app.Workbooks.Open(abs_path, ReadOnly=read_only)
                 sheets = [s.Name for s in wb.Sheets]
@@ -362,7 +553,7 @@ class ExcelEngine:
         # Try Live COM if no filepath is given or Excel has the file open
         if COM_AVAILABLE and not filepath:
             try:
-                pythoncom.CoInitialize()
+                ensure_com()
                 app = LiveExcelSession.get_app(create_if_missing=False)
                 wb = LiveExcelSession.get_workbook(app, filepath)
                 ws = LiveExcelSession.get_sheet(wb, sheet_name)
@@ -463,7 +654,7 @@ class ExcelEngine:
         # Try Live COM
         if COM_AVAILABLE and not filepath:
             try:
-                pythoncom.CoInitialize()
+                ensure_com()
                 app = LiveExcelSession.get_app(create_if_missing=False)
                 wb = LiveExcelSession.get_workbook(app, filepath)
                 ws = LiveExcelSession.get_sheet(wb, sheet_name)
@@ -560,7 +751,7 @@ class ExcelEngine:
         # Try Live COM
         if COM_AVAILABLE and not filepath:
             try:
-                pythoncom.CoInitialize()
+                ensure_com()
                 app = LiveExcelSession.get_app(create_if_missing=False)
                 wb = LiveExcelSession.get_workbook(app, filepath)
                 ws = LiveExcelSession.get_sheet(wb, sheet_name)
@@ -683,6 +874,103 @@ class ExcelEngine:
         }
 
     @classmethod
+    def clear_range(
+        cls,
+        range_address: Optional[str] = None,
+        filepath: Optional[str] = None,
+        sheet_name: Optional[str] = None,
+        clear_type: str = "all"
+    ) -> Dict[str, Any]:
+        """
+        Clear contents, formatting, or all from a specific range or entire worksheet.
+        
+        Args:
+            range_address: Optional range to clear (e.g. 'A1:C10'). If omitted, clears entire worksheet.
+            filepath: Optional file path. If omitted, targets active workbook in live Excel.
+            sheet_name: Optional sheet name. Defaults to active sheet.
+            clear_type: 'all' (contents + styling), 'contents' (data only), 'formats' (styling only).
+        """
+        if COM_AVAILABLE:
+            try:
+                ensure_com()
+                app = win32com.client.GetActiveObject("Excel.Application")
+                wb = LiveExcelSession.get_workbook(app, filepath)
+                ws = LiveExcelSession.get_sheet(wb, sheet_name)
+                
+                if range_address:
+                    target = ws.Range(range_address)
+                    target_desc = f"range {range_address}"
+                else:
+                    target = ws.Cells
+                    target_desc = f"entire sheet '{ws.Name}'"
+                    
+                ct = clear_type.lower()
+                if ct == "contents":
+                    target.ClearContents()
+                elif ct == "formats":
+                    target.ClearFormats()
+                else:
+                    target.Clear()
+                    if not range_address:
+                        ws.Columns.ColumnWidth = 10.0
+                        
+                return {
+                    "success": True,
+                    "message": f"Successfully cleared {target_desc} ({ct}) in live Excel",
+                    "workbook": wb.Name,
+                    "sheet": ws.Name,
+                    "range": range_address or "ALL"
+                }
+            except Exception as com_err:
+                if not filepath:
+                    raise com_err
+
+        if not filepath:
+            raise RuntimeError("Excel is not running and no filepath was provided.")
+            
+        abs_path = os.path.abspath(filepath)
+        if not os.path.exists(abs_path):
+            raise FileNotFoundError(f"File not found: {abs_path}")
+            
+        wb = openpyxl.load_workbook(abs_path)
+        if sheet_name:
+            if sheet_name not in wb.sheetnames:
+                raise ValueError(f"Sheet '{sheet_name}' not found.")
+            ws = wb[sheet_name]
+        else:
+            ws = wb.active
+            
+        ct = clear_type.lower()
+        if range_address:
+            cells = ws[range_address]
+            if not isinstance(cells, tuple):
+                cells = ((cells,),)
+            elif not isinstance(cells[0], tuple):
+                cells = (cells,)
+        else:
+            cells = ws.iter_rows()
+            
+        for row in cells:
+            for cell in row:
+                if ct in ("all", "contents"):
+                    cell.value = None
+                if ct in ("all", "formats"):
+                    cell.font = Font()
+                    cell.fill = PatternFill()
+                    cell.border = Border()
+                    cell.alignment = Alignment()
+                    cell.number_format = "General"
+                    
+        wb.save(abs_path)
+        return {
+            "success": True,
+            "message": f"Successfully cleared {range_address or 'entire sheet'} ({ct}) in '{abs_path}'",
+            "filepath": abs_path,
+            "sheet": ws.title,
+            "range": range_address or "ALL"
+        }
+
+    @classmethod
     def add_chart(
         cls,
         chart_type: str,
@@ -705,7 +993,7 @@ class ExcelEngine:
         # Try Live COM
         if COM_AVAILABLE and not filepath:
             try:
-                pythoncom.CoInitialize()
+                ensure_com()
                 app = LiveExcelSession.get_app(create_if_missing=False)
                 wb = LiveExcelSession.get_workbook(app, filepath)
                 ws = LiveExcelSession.get_sheet(wb, sheet_name)
@@ -823,7 +1111,7 @@ class ExcelEngine:
         """Add a new worksheet to the workbook."""
         if COM_AVAILABLE and not filepath:
             try:
-                pythoncom.CoInitialize()
+                ensure_com()
                 app = LiveExcelSession.get_app(create_if_missing=False)
                 wb = LiveExcelSession.get_workbook(app, filepath)
                 ws = wb.Sheets.Add(After=wb.Sheets(wb.Sheets.Count))
@@ -859,7 +1147,7 @@ class ExcelEngine:
         """List all sheets and dimensions."""
         if COM_AVAILABLE and not filepath:
             try:
-                pythoncom.CoInitialize()
+                ensure_com()
                 app = LiveExcelSession.get_app(create_if_missing=False)
                 wb = LiveExcelSession.get_workbook(app, filepath)
                 sheets_info = []
@@ -916,7 +1204,7 @@ class ExcelEngine:
         abs_pdf = os.path.abspath(output_pdf_path)
         os.makedirs(os.path.dirname(abs_pdf), exist_ok=True)
         
-        pythoncom.CoInitialize()
+        ensure_com()
         app = LiveExcelSession.get_app(create_if_missing=True, visible=False)
         wb = LiveExcelSession.get_workbook(app, filepath)
         
@@ -944,7 +1232,7 @@ class ExcelEngine:
         """Save active or specified workbook."""
         if COM_AVAILABLE and not filepath:
             try:
-                pythoncom.CoInitialize()
+                ensure_com()
                 app = LiveExcelSession.get_app(create_if_missing=False)
                 wb = LiveExcelSession.get_workbook(app, filepath)
                 if save_as_path:
@@ -1049,7 +1337,7 @@ class ExcelEngine:
         
         if COM_AVAILABLE:
             try:
-                pythoncom.CoInitialize()
+                ensure_com()
                 app = LiveExcelSession.get_app(create_if_missing=False)
                 if app:
                     wb = LiveExcelSession.get_workbook(app, filepath)
@@ -1068,16 +1356,14 @@ class ExcelEngine:
         if COM_AVAILABLE:
             local_vars["win32com"] = win32com
             
-        # Capture stdout
+        # Capture stdout safely using contextlib
         import io
-        import sys
+        import contextlib
         
         stdout_buf = io.StringIO()
-        old_stdout = sys.stdout
-        sys.stdout = stdout_buf
-        
         try:
-            exec(code, globals(), local_vars)
+            with contextlib.redirect_stdout(stdout_buf):
+                exec(code, globals(), local_vars)
             stdout_content = stdout_buf.getvalue()
             return {
                 "success": True,
@@ -1089,8 +1375,6 @@ class ExcelEngine:
                 "error": str(e),
                 "output": stdout_buf.getvalue().strip()
             }
-        finally:
-            sys.stdout = old_stdout
 
     @staticmethod
     def _to_markdown_table(matrix: List[List[Any]]) -> str:
@@ -1105,3 +1389,440 @@ class ExcelEngine:
         row_lines = ["| " + " | ".join(str(c if c is not None else "") for c in row) + " |" for row in rows]
         
         return "\n".join([header_line, sep_line] + row_lines)
+
+
+def _run(fn, *args, **kwargs):
+    """Execute on the dedicated COM worker thread connected to the interactive desktop."""
+    return WORKER.submit(fn, *args, **kwargs)
+
+
+# Initialize MCP Server
+mcp = FastMCP("excel-mcp-server")
+
+
+@mcp.tool()
+def excel_status() -> str:
+    """
+    Check the current status of Microsoft Excel and active workbooks.
+    Returns whether Excel is running, COM availability, version, open workbooks, and active sheet.
+    """
+    status = _run(ExcelEngine.get_status)
+    if status.get("excel_running"):
+        wb_names = [wb["name"] for wb in status.get("open_workbooks", [])]
+        return (
+            f"✅ Microsoft Excel (v{status.get('version')}) is RUNNING.\n"
+            f"- Open Workbooks ({len(wb_names)}): {', '.join(wb_names) if wb_names else 'None'}\n"
+            f"- Active Workbook: {status.get('active_workbook', 'None')}\n"
+            f"- Active Sheet: {status.get('active_sheet', 'None')}"
+        )
+    else:
+        com_status = "Available (Excel will be launched if needed)." if status.get("com_available") else "Unavailable (pywin32 not installed or non-Windows OS)."
+        return (
+            "ℹ️ Microsoft Excel is currently NOT running.\n"
+            f"- COM automation: {com_status}\n"
+            "- Headless file mode: Active (openpyxl can read/write files directly)."
+        )
+
+
+@mcp.tool()
+def excel_create_workbook(
+    filepath: Optional[str] = None,
+    sheet_name: str = "Sheet1",
+    headers: Optional[List[str]] = None,
+    data: Optional[List[List[Any]]] = None,
+    visible: bool = True,
+    table_style: Optional[str] = None
+) -> str:
+    """
+    Create a new Excel workbook with optional initial data, headers, sheet name, and table style.
+    
+    Args:
+        filepath: Optional path where the workbook will be saved (e.g., 'reports/sales.xlsx'). If omitted, creates an unsaved workbook in live Excel.
+        sheet_name: Name of the initial sheet (default: 'Sheet1').
+        headers: List of column header names (e.g. ['Product', 'Price', 'Quantity', 'Total']).
+        data: 2D list of row values/formulas (e.g. [['Apple', 1.5, 10, '=B2*C2'], ['Orange', 2.0, 5, '=B3*C3']]).
+        visible: Whether to make Excel visible on screen when opened via COM (default: True).
+        table_style: Optional Excel table style name (e.g., 'TableStyleMedium2', 'TableStyleLight1', 'TableStyleDark1').
+    """
+    try:
+        res = _run(
+            ExcelEngine.create_workbook,
+            filepath=filepath,
+            sheet_name=sheet_name,
+            headers=headers,
+            data=data,
+            visible=visible,
+            table_style=table_style
+        )
+        return json.dumps(res, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"❌ Error creating workbook: {str(e)}"
+
+
+@mcp.tool()
+def excel_open_workbook(
+    filepath: str,
+    read_only: bool = False,
+    visible: bool = True
+) -> str:
+    """
+    Open an existing Excel workbook file (.xlsx, .xlsm, .xls, .csv).
+    
+    Args:
+        filepath: Full path to the workbook file.
+        read_only: Open the file in read-only mode (default: False).
+        visible: Make Excel visible on screen (default: True).
+    """
+    try:
+        res = _run(ExcelEngine.open_workbook, filepath=filepath, read_only=read_only, visible=visible)
+        return json.dumps(res, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"❌ Error opening workbook: {str(e)}"
+
+
+@mcp.tool()
+def excel_read_range(
+    filepath: Optional[str] = None,
+    sheet_name: Optional[str] = None,
+    range_address: Optional[str] = None,
+    include_formulas: bool = False,
+    output_format: str = "markdown_table"
+) -> str:
+    """
+    Read data and formulas from a worksheet or cell range.
+    
+    Args:
+        filepath: Optional file path. If omitted, reads from active workbook in live Excel.
+        sheet_name: Worksheet name (e.g. 'Sheet1', 'Sales'). Defaults to active sheet.
+        range_address: Range to read (e.g. 'A1:D10', 'B2', or omit to read entire used range).
+        include_formulas: If True, returns formulas (e.g. '=SUM(A1:A5)') instead of evaluated values (default: False).
+        output_format: 'markdown_table' (default, easiest for LLM to view), 'json', or 'records'.
+    """
+    try:
+        res = _run(
+            ExcelEngine.read_range,
+            filepath=filepath,
+            sheet_name=sheet_name,
+            range_address=range_address,
+            include_formulas=include_formulas,
+            output_format=output_format
+        )
+        if output_format == "markdown_table" and "markdown" in res:
+            header = f"**Sheet:** `{res['sheet']}` | **Range:** `{res['range']}` ({res['row_count']} rows x {res['col_count']} cols)\n\n"
+            return header + res["markdown"]
+        return json.dumps(res, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"❌ Error reading range: {str(e)}"
+
+
+@mcp.tool()
+def excel_write_range(
+    data: List[List[Any]],
+    start_cell: str = "A1",
+    filepath: Optional[str] = None,
+    sheet_name: Optional[str] = None,
+    auto_fit_columns: bool = True
+) -> str:
+    """
+    Write a 2D matrix of values and formulas into a worksheet.
+    
+    Args:
+        data: 2D array of rows and columns (e.g. [['Revenue', 1000], ['Cost', 600], ['Profit', '=B1-B2']]).
+        start_cell: Top-left cell address to start writing (default: 'A1').
+        filepath: Optional file path. If omitted, writes to active workbook in live Excel.
+        sheet_name: Optional sheet name (defaults to active sheet).
+        auto_fit_columns: Auto-fit column widths after writing (default: True).
+    """
+    try:
+        res = _run(
+            ExcelEngine.write_range,
+            data=data,
+            start_cell=start_cell,
+            filepath=filepath,
+            sheet_name=sheet_name,
+            auto_fit_columns=auto_fit_columns
+        )
+        return json.dumps(res, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"❌ Error writing range: {str(e)}"
+
+
+@mcp.tool()
+def excel_format_range(
+    range_address: str,
+    filepath: Optional[str] = None,
+    sheet_name: Optional[str] = None,
+    bold: Optional[bool] = None,
+    italic: Optional[bool] = None,
+    font_size: Optional[int] = None,
+    font_name: Optional[str] = None,
+    font_color: Optional[str] = None,
+    bg_color: Optional[str] = None,
+    number_format: Optional[str] = None,
+    horizontal_align: Optional[str] = None,
+    border: Optional[str] = None,
+    auto_fit: Optional[bool] = None
+) -> str:
+    """
+    Format a cell range with colors, font styling, borders, alignment, and number formats.
+    
+    Args:
+        range_address: Cell range (e.g. 'A1:D1', 'B2:B20').
+        filepath: Optional file path. If omitted, formats active workbook in live Excel.
+        sheet_name: Optional worksheet name.
+        bold: Set font bold (True / False).
+        italic: Set font italic (True / False).
+        font_size: Font size in points (e.g. 11, 14, 16).
+        font_name: Font family name (e.g. 'Segoe UI', 'Calibri', 'Arial').
+        font_color: Hex color string for text (e.g. '#FFFFFF', '#002060', '#C00000').
+        bg_color: Hex color string for cell fill (e.g. '#1F497D', '#D9E1F2', '#E2EFDA').
+        number_format: Excel format string (e.g. '$#,##0.00', '0.0%', 'yyyy-mm-dd', '#,##0').
+        horizontal_align: Text alignment ('left', 'center', 'right').
+        border: Border style ('all_thin', 'outline_thick', 'bottom_double', 'none').
+        auto_fit: Auto-fit column widths (True / False).
+    """
+    try:
+        res = _run(
+            ExcelEngine.format_range,
+            range_address=range_address,
+            filepath=filepath,
+            sheet_name=sheet_name,
+            bold=bold,
+            italic=italic,
+            font_size=font_size,
+            font_name=font_name,
+            font_color=font_color,
+            bg_color=bg_color,
+            number_format=number_format,
+            horizontal_align=horizontal_align,
+            border=border,
+            auto_fit=auto_fit
+        )
+        return json.dumps(res, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"❌ Error formatting range: {str(e)}"
+
+
+@mcp.tool()
+def excel_clear_range(
+    range_address: Optional[str] = None,
+    filepath: Optional[str] = None,
+    sheet_name: Optional[str] = None,
+    clear_type: str = "all"
+) -> str:
+    """
+    Clear contents, formatting, or everything from a cell range or entire worksheet.
+    
+    Args:
+        range_address: Optional range to clear (e.g. 'A1:D10', 'B2'). If omitted, clears the entire worksheet.
+        filepath: Optional file path. If omitted, clears active workbook in live Excel.
+        sheet_name: Optional worksheet name. Defaults to active worksheet.
+        clear_type: 'all' (default: clears data, formulas, and formats), 'contents' (clears data only), 'formats' (clears styles only).
+    """
+    try:
+        res = _run(
+            ExcelEngine.clear_range,
+            range_address=range_address,
+            filepath=filepath,
+            sheet_name=sheet_name,
+            clear_type=clear_type
+        )
+        return json.dumps(res, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"❌ Error clearing range: {str(e)}"
+
+
+@mcp.tool()
+def excel_add_chart(
+    chart_type: str,
+    data_range: str,
+    title: Optional[str] = None,
+    x_axis_title: Optional[str] = None,
+    y_axis_title: Optional[str] = None,
+    position_cell: str = "E2",
+    width: int = 450,
+    height: int = 280,
+    filepath: Optional[str] = None,
+    sheet_name: Optional[str] = None
+) -> str:
+    """
+    Insert a chart into the worksheet based on a data range.
+    
+    Args:
+        chart_type: Type of chart: 'column_clustered', 'bar_clustered', 'line', 'pie', 'area', 'scatter', 'doughnut'.
+        data_range: Range containing headers and data for the chart (e.g. 'A1:B10', 'A1:D6').
+        title: Title of the chart.
+        x_axis_title: Optional X-axis category label.
+        y_axis_title: Optional Y-axis value label.
+        position_cell: Top-left cell where the chart will be placed (e.g. 'E2', 'G1').
+        width: Chart width in points (default: 450).
+        height: Chart height in points (default: 280).
+        filepath: Optional file path. If omitted, adds chart to active workbook in live Excel.
+        sheet_name: Optional worksheet name.
+    """
+    try:
+        res = _run(
+            ExcelEngine.add_chart,
+            chart_type=chart_type,
+            data_range=data_range,
+            title=title,
+            x_axis_title=x_axis_title,
+            y_axis_title=y_axis_title,
+            position_cell=position_cell,
+            width=width,
+            height=height,
+            filepath=filepath,
+            sheet_name=sheet_name
+        )
+        return json.dumps(res, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"❌ Error adding chart: {str(e)}"
+
+
+@mcp.tool()
+def excel_add_sheet(
+    sheet_name: str,
+    filepath: Optional[str] = None
+) -> str:
+    """
+    Add a new worksheet to the workbook.
+    
+    Args:
+        sheet_name: Name for the new worksheet.
+        filepath: Optional file path. If omitted, adds sheet to active workbook in live Excel.
+    """
+    try:
+        res = _run(ExcelEngine.add_sheet, sheet_name=sheet_name, filepath=filepath)
+        return json.dumps(res, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"❌ Error adding sheet: {str(e)}"
+
+
+@mcp.tool()
+def excel_list_sheets(
+    filepath: Optional[str] = None
+) -> str:
+    """
+    List all worksheets in the workbook with their dimensions and row/column counts.
+    
+    Args:
+        filepath: Optional file path. If omitted, lists sheets from active workbook in live Excel.
+    """
+    try:
+        res = _run(ExcelEngine.list_sheets, filepath=filepath)
+        return json.dumps(res, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"❌ Error listing sheets: {str(e)}"
+
+
+@mcp.tool()
+def excel_export_pdf(
+    output_pdf_path: str,
+    filepath: Optional[str] = None,
+    sheet_name: Optional[str] = None,
+    orientation: str = "landscape"
+) -> str:
+    """
+    Export the worksheet or entire workbook to a PDF file.
+    
+    Args:
+        output_pdf_path: Destination file path for the generated PDF (e.g. 'E:/reports/report.pdf').
+        filepath: Optional source Excel file path. If omitted, exports active workbook from live Excel.
+        sheet_name: Optional specific sheet to export. If omitted, exports the active sheet or workbook.
+        orientation: Page orientation ('landscape' or 'portrait'). Default: 'landscape'.
+    """
+    try:
+        res = _run(
+            ExcelEngine.export_pdf,
+            output_pdf_path=output_pdf_path,
+            filepath=filepath,
+            sheet_name=sheet_name,
+            orientation=orientation
+        )
+        return json.dumps(res, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"❌ Error exporting PDF: {str(e)}"
+
+
+@mcp.tool()
+def excel_save_workbook(
+    save_as_path: Optional[str] = None,
+    filepath: Optional[str] = None
+) -> str:
+    """
+    Save the currently active workbook or save it to a new file path.
+    
+    Args:
+        save_as_path: Optional new destination path to save as.
+        filepath: Optional specific workbook file to save.
+    """
+    try:
+        res = _run(ExcelEngine.save_workbook, save_as_path=save_as_path, filepath=filepath)
+        return json.dumps(res, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"❌ Error saving workbook: {str(e)}"
+
+
+@mcp.tool()
+def excel_analyze_sheet(
+    filepath: Optional[str] = None,
+    sheet_name: Optional[str] = None,
+    has_headers: bool = True
+) -> str:
+    """
+    Generate an in-depth statistical analysis, column schema profile, and data distribution of a worksheet.
+    
+    Args:
+        filepath: Optional file path. If omitted, analyzes active worksheet in live Excel.
+        sheet_name: Optional sheet name.
+        has_headers: Whether the first row contains column headers (default: True).
+    """
+    try:
+        res = _run(
+            ExcelEngine.analyze_sheet,
+            filepath=filepath,
+            sheet_name=sheet_name,
+            has_headers=has_headers
+        )
+        return json.dumps(res, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"❌ Error analyzing sheet: {str(e)}"
+
+
+@mcp.tool()
+def excel_execute_script(
+    code: str,
+    filepath: Optional[str] = None
+) -> str:
+    """
+    Execute arbitrary Python automation code with direct access to Excel and OpenPyXL objects.
+    
+    Injected variables available in code:
+      - `app`: Excel.Application COM instance (win32com.client)
+      - `wb`: Active Workbook COM instance
+      - `ws`: Active Worksheet COM instance
+      - `win32com`: win32com.client module
+      - `openpyxl`: openpyxl module
+      - `engine`: ExcelEngine class
+      - `filepath`: target filepath if provided
+      
+    Args:
+        code: Python script string to execute.
+        filepath: Optional target workbook file path.
+    """
+    try:
+        res = _run(ExcelEngine.execute_script, code=code, filepath=filepath)
+        if res.get("success"):
+            return f"✅ Execution Successful:\n{res.get('output')}"
+        else:
+            return f"❌ Execution Failed:\nError: {res.get('error')}\nOutput:\n{res.get('output')}"
+    except Exception as e:
+        return f"❌ Error executing script: {str(e)}"
+
+
+def main():
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()

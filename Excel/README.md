@@ -48,7 +48,7 @@ This server features a hybrid dual-engine design tailored for both interactive d
    - Direct file reading and writing without requiring Microsoft Excel to be installed or running.
    - 100% compatible with Windows, macOS, and Linux server environments.
 
-## 🛠️ Complete MCP Tools Catalog (13 Tools)
+## 🛠️ Complete MCP Tools Catalog (14 Tools)
 
 | Tool Name | Engine Support | Description | Key Arguments |
 | :--- | :--- | :--- | :--- |
@@ -58,6 +58,7 @@ This server features a hybrid dual-engine design tailored for both interactive d
 | `excel_read_range` | COM + openpyxl | Reads values or formulas from a range or sheet in Markdown table, JSON, or record formats. | `filepath`, `sheet_name`, `range_address`, `include_formulas`, `output_format` |
 | `excel_write_range` | COM + openpyxl | Writes a 2D matrix of values and formulas into cells with optional column AutoFit. | `data`, `start_cell`, `filepath`, `sheet_name`, `auto_fit_columns` |
 | `excel_format_range` | COM + openpyxl | Formats cells (colors, fonts, bold/italic, borders, alignments, and number formats). | `range_address`, `filepath`, `sheet_name`, `bold`, `font_size`, `font_color`, `bg_color`, `number_format`, `border` |
+| `excel_clear_range` | COM + openpyxl | Clears contents, styles, or everything from a range or the entire worksheet. | `range_address`, `filepath`, `sheet_name`, `clear_type` |
 | `excel_add_chart` | COM + openpyxl | Inserts charts (Column, Bar, Line, Pie, Area, Scatter, Doughnut) linked to a data range. | `chart_type`, `data_range`, `title`, `x_axis_title`, `y_axis_title`, `position_cell`, `filepath` |
 | `excel_add_sheet` | COM + openpyxl | Adds a new worksheet to an active or specified workbook. | `sheet_name`, `filepath` |
 | `excel_list_sheets` | COM + openpyxl | Lists all worksheets, used range dimensions, row counts, and column counts. | `filepath` |
@@ -107,7 +108,7 @@ Add the Excel MCP server to your favorite MCP client configuration file:
     "excel": {
       "command": "python",
       "args": [
-        "/path/to/excel-mcp-server/excel_mcp_server.py"
+        "/path/to/excel-mcp-server/excel_mcp_servers.py"
       ],
       "env": {
         "PYTHONIOENCODING": "utf-8"
@@ -136,7 +137,7 @@ Navigate to **Cursor Settings > Features > MCP > Add New MCP Server**:
     "excel": {
       "command": "python",
       "args": [
-        "/path/to/excel-mcp-server/excel_mcp_server.py"
+        "/path/to/excel-mcp-server/excel_mcp_servers.py"
       ],
       "env": {
         "PYTHONIOENCODING": "utf-8"
@@ -153,7 +154,7 @@ Navigate to **Cursor Settings > Features > MCP > Add New MCP Server**:
     "excel": {
       "command": "python",
       "args": [
-        "/path/to/excel-mcp-server/excel_mcp_server.py"
+        "/path/to/excel-mcp-server/excel_mcp_servers.py"
       ],
       "env": {
         "PYTHONIOENCODING": "utf-8"
@@ -171,7 +172,7 @@ Add to your extension's MCP configuration settings:
     "excel": {
       "command": "python",
       "args": [
-        "/path/to/excel-mcp-server/excel_mcp_server.py"
+        "/path/to/excel-mcp-server/excel_mcp_servers.py"
       ],
       "env": {
         "PYTHONIOENCODING": "utf-8"

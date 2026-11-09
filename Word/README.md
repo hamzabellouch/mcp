@@ -11,7 +11,7 @@ Empower LLMs and AI agents to create, format, and manipulate Microsoft Word docu
 
 ## Overview
 
-**Microsoft Word MCP Server (Enterprise Edition)** is a robust, enterprise-grade Model Context Protocol (MCP) server providing 22 specialized tools for complete document generation, styling, and management.
+**Microsoft Word MCP Server (Enterprise Edition)** is a robust, enterprise-grade Model Context Protocol (MCP) server providing 21 specialized tools (plus an opt-in 22nd, `word_execute_script`) for complete document generation, styling, and management.
 
 It combines interactive live desktop control via Windows COM with cross-platform headless document processing via `python-docx` and `lxml`. AI assistants can construct formatted reports, edit tables, manage dynamic tables of contents (TOC), insert watermarks, and export print-ready PDFs through simple natural language prompts.
 
@@ -27,7 +27,7 @@ This server is powered by a robust dual-engine design that automatically selects
                                      ▼
                   ┌─────────────────────────────────────┐
                   │           Word MCP Server           │
-                  │        (22 Specialized Tools)       │
+                  │        (21 + 1 opt-in Tools)        │
                   └──────────────────┬──────────────────┘
                                      │
                  ┌───────────────────┴───────────────────┐
@@ -53,7 +53,7 @@ This server is powered by a robust dual-engine design that automatically selects
    - Built on top of `python-docx` and `lxml` for lightning-fast server-side processing without requiring Microsoft Office.
    - Ideal for CI/CD pipelines, Docker containers, cloud environments, batch document generation, and template rendering across Windows, macOS, and Linux.
 
-## 🛠️ Complete Tool Catalog (22 Tools)
+## 🛠️ Complete Tool Catalog (21 Tools + 1 opt-in)
 
 ### 1. Core Document Management
 
@@ -95,16 +95,38 @@ This server is powered by a robust dual-engine design that automatically selects
 
 | Tool Name | Description | Key Parameters |
 | :--- | :--- | :--- |
-| `word_execute_script` | Execute arbitrary Python automation scripts with direct access to COM and python-docx objects. | `code`, `filepath` |
+| `word_execute_script` | **Disabled by default.** Executes arbitrary Python with direct access to COM and python-docx objects. Only registered when `WORD_MCP_ENABLE_SCRIPT=1`. | `code`, `filepath` |
+
+## 🎛️ Live vs. Headless: how the server decides (read this first)
+
+The server never edits a `.docx` behind the back of a Word window that has it open.
+
+| `WORD_MCP_MODE` | Behaviour |
+| :--- | :--- |
+| `auto` *(default)* | If Word is running, **attach to that exact Word window** and edit live (you see every change). If Word is **not** running, edit the file directly with `python-docx`. |
+| `live` | COM only. If Word is not running or cannot be reached, the tool fails with a clear message. |
+| `headless` | `python-docx` only. COM is never used (except PDF export, which always needs Word). |
+
+Safety rules built into the COM layer:
+
+- **Attach, never duplicate.** The server attaches to the running Word. If a `WINWORD.EXE` process exists but COM cannot reach it (typically *Word elevated vs. server not elevated*, or a start-up dialog), the tool fails with an explanation instead of launching a second instance.
+- **A live failure is an error, not a silent file edit.** Earlier versions swallowed COM errors and fell back to rewriting the file on disk, which is why changes did not appear (and could be overwritten by Word later).
+- **Word is only quit if this server started it** (hidden instance used for PDF export, and only when it holds no documents). Your own Word window is never closed.
+- **No invisible Word.** Word launched by a tool is always visible.
+- **One COM thread.** All tool calls run serially on a single dedicated thread, which is what COM requires and prevents two agent calls from interleaving edits.
+- **`DisplayAlerts` is restored** after every call; `~$` lock files are no longer deleted.
+- Transient "call was rejected by callee" errors are retried while attaching/opening documents.
+
+Other environment variables: `WORD_MCP_TIMEOUT` (seconds per tool call, default 120), `WORD_MCP_LOG` (`DEBUG`/`INFO`/`WARNING`, logs go to **stderr** because stdout is the MCP channel).
 
 ## 🔒 Security Notice (`word_execute_script`)
 
 > [!WARNING]
-> The `word_execute_script` tool allows arbitrary Python code execution within the host environment to enable complex automations and COM object manipulations.
-> 
-> - **Trust Boundaries**: Only connect this MCP server to trusted AI clients and applications.
+> `word_execute_script` is **not exposed unless you set `WORD_MCP_ENABLE_SCRIPT=1`** in the server's environment. When enabled it allows arbitrary Python execution within the host environment.
+>
+> - **Trust Boundaries**: Only enable it for trusted AI clients and applications.
 > - **Execution Context**: The script runs with the same permissions as the host Python process.
-> - **Sandboxing**: When deploying in multi-tenant or untrusted environments, execute the server inside an isolated container or virtual environment.
+> - **Sandboxing**: In multi-tenant or untrusted environments, run the server inside an isolated container or virtual environment.
 
 ## 📦 Installation & Setup
 
@@ -233,27 +255,32 @@ Add the Word MCP Server to your preferred AI agent environment using the snippet
 
 ## 🧪 Verification & Testing
 
-Run the included comprehensive 16-step test suite to verify that all 22 tools execute flawlessly:
+Unit tests (any OS, use a fake Word, verify the live/headless safety rules):
+
+```bash
+pip install pytest
+python -m pytest -q tests
+```
+
+End-to-end smoke test of all tools (on Windows with Word installed this also exercises live COM and PDF export; on other systems PDF export is skipped):
 
 ```bash
 python test_mcp.py
 ```
 
-Expected output:
-```text
-=======================================================
-   WORD MCP SERVER ENTERPRISE VERIFICATION SUITE       
-=======================================================
-[1/16] Testing word_status()...
-[2/16] Testing word_create_document()...
-...
-=======================================================
-   ALL 22 WORD MCP TOOLS VERIFIED & WORKING FLAWLESSLY! 
-=======================================================
-```
+The script exits with a non-zero code and lists every failing tool if anything fails.
 
 > [!WARNING]
 > Document generation and template variable substitution can modify files on disk. There is always a possibility of error, so we assume no responsibility for any inaccuracies.
+
+## 🩺 Troubleshooting
+
+| Symptom | Likely cause / fix |
+| :--- | :--- |
+| `Word is running but COM cannot attach to it` | Word and the server run at different privilege levels (one "as administrator"), or Word shows a start-up/recovery dialog. Run both normally and close the dialog. |
+| `Word did not finish within 120s` | A modal dialog is open in Word (save prompt, password, repair). Close it, retry. Raise `WORD_MCP_TIMEOUT` for very large documents. |
+| Tool says live edit failed and the file was not modified | By design. Word was reachable but rejected the operation. Make sure Word is idle and retry; use `word_status` to inspect state. |
+| Changes not visible | Check `word_status`: in `headless` mode or when Word is closed, edits go to the file; open it afterwards. Use `WORD_MCP_MODE=live` to forbid file edits. |
 
 ### <a name="Copyright©2026"></a> Copyright © 2026
 

@@ -72,7 +72,8 @@ class ToggleRemoteConnectionsCommand:
         return {
             "MenuText": "Remote Connections",
             "ToolTip": "Enable or disable remote connections for the RPC server.",
-            "Checkable": bool(settings.get("remote_enabled", False)),
+            "Checkable": True,
+            "Checked": bool(settings.get("remote_enabled", False)),
         }
 
     def Activated(self, checked=0):
@@ -171,7 +172,7 @@ class SetAuthTokenCommand:
             "Enter the auth token clients must present (leave blank to disable\n"
             "authentication). The MCP server passes it via --auth-token or the\n"
             "FREECAD_MCP_TOKEN environment variable.",
-            QtWidgets.QLineEdit.Normal,
+            QtWidgets.QLineEdit.Password,
             current,
         )
         if not ok:
@@ -198,7 +199,8 @@ class ToggleAutoStartCommand:
         return {
             "MenuText": "Auto-Start Server",
             "ToolTip": "Automatically start the RPC server when FreeCAD launches.",
-            "Checkable": bool(settings.get("auto_start_rpc", False)),
+            "Checkable": True,
+            "Checked": bool(settings.get("auto_start_rpc", False)),
         }
 
     def Activated(self, checked=0):

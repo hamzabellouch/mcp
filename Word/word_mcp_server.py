@@ -8,6 +8,7 @@ Supports both live desktop Word automation (via COM/pywin32) and headless docume
 import os
 import sys
 import json
+import logging
 from typing import List, Optional, Dict, Any
 
 # Ensure server directory is in sys.path
@@ -24,7 +25,29 @@ except (ImportError, ModuleNotFoundError):
         raise ImportError("Please install mcp: pip install mcp")
 
 
-from word_engine import WordEngine
+from com_runtime import WORKER, get_mode, script_execution_enabled
+from word_engine import WordEngine, LiveWordSession
+
+log = logging.getLogger("word_mcp")
+
+
+def _job(fn, *args, **kwargs):
+    """Runs on the single COM thread. Always hands DisplayAlerts back to the user afterwards."""
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        try:
+            LiveWordSession.restore_ui()
+        except Exception:  # noqa: BLE001
+            log.debug("restore_ui failed", exc_info=True)
+
+
+def _run(fn, *args, **kwargs):
+    """
+    Execute an engine call on the dedicated COM thread (COM objects are apartment-threaded,
+    and serialising calls keeps two agent requests from interleaving edits in one document).
+    """
+    return WORKER.submit(_job, fn, *args, **kwargs)
 
 # Initialize FastMCP Server
 mcp = FastMCP("word-mcp-server")
@@ -34,23 +57,31 @@ mcp = FastMCP("word-mcp-server")
 def word_status() -> str:
     """
     Check the current status of Microsoft Word and active documents.
-    Returns whether Word is running, COM availability, version, open documents, and active document.
+    Returns the execution mode, whether Word is running, version, open documents and the active document.
     """
-    status = WordEngine.get_status()
+    status = _run(WordEngine.get_status)
+    mode = status.get("mode")
     if status["word_running"]:
         doc_names = [d["name"] for d in status["open_documents"]]
         return (
-            f"✅ Microsoft Word (v{status.get('version')}) is RUNNING.\n"
+            f"✅ Microsoft Word (v{status.get('version')}) is RUNNING and reachable. Mode: {mode}\n"
             f"- Open Documents ({len(doc_names)}): {', '.join(doc_names) if doc_names else 'None'}\n"
-            f"- Active Document: {status.get('active_document', 'None')}\n"
-            f"- Active Document Path: {status.get('active_document_path', 'None')}"
+            f"- Active Document: {status.get('active_document') or 'None'}\n"
+            f"- Active Document Path: {status.get('active_document_path') or 'None'}\n"
+            "- Edits are applied live inside Word (you will see them on screen)."
         )
-    else:
+    if status.get("word_process_found"):
         return (
-            "ℹ️ Microsoft Word is currently NOT running.\n"
-            "- COM automation: Available (Word will be launched if needed).\n"
-            "- Headless file mode: Active (python-docx can read/write files directly)."
+            f"⚠️ A Word process exists but COM cannot attach to it. Mode: {mode}\n"
+            f"- {status.get('hint')}\n"
+            "- Live edits will fail with a clear error; files are NOT edited behind Word's back."
         )
+    com = "Available" if status.get("com_available") else "NOT available (install pywin32 on Windows)"
+    return (
+        f"ℹ️ Microsoft Word is currently NOT running. Mode: {mode}\n"
+        f"- COM automation: {com}.\n"
+        "- Files that are not open in Word can be edited directly (python-docx)."
+    )
 
 
 @mcp.tool()
@@ -63,7 +94,7 @@ def word_create_document(
 ) -> str:
     """
     Create a new Microsoft Word document with optional initial title, subtitle, and author metadata block.
-    
+
     Args:
         filepath: Optional path where document will be saved (e.g., 'E:/reports/Q1_Report.docx'). If omitted, creates an unsaved document in live Word.
         title: Main document title banner (e.g. 'Project Proposal & Technical Plan').
@@ -72,7 +103,7 @@ def word_create_document(
         visible: Whether to make Word visible on screen when launched via COM (default: True).
     """
     try:
-        res = WordEngine.create_document(
+        res = _run(WordEngine.create_document,
             filepath=filepath,
             title=title,
             subtitle=subtitle,
@@ -92,14 +123,14 @@ def word_open_document(
 ) -> str:
     """
     Open an existing Word document (.docx, .doc, .rtf).
-    
+
     Args:
         filepath: Full file path to the document file.
         read_only: Open the document in read-only mode (default: False).
         visible: Make Word window visible on screen (default: True).
     """
     try:
-        res = WordEngine.open_document(filepath=filepath, read_only=read_only, visible=visible)
+        res = _run(WordEngine.open_document, filepath=filepath, read_only=read_only, visible=visible)
         return json.dumps(res, indent=2, ensure_ascii=False)
     except Exception as e:
         return f"❌ Error opening document: {str(e)}"
@@ -114,7 +145,7 @@ def word_read_document(
 ) -> str:
     """
     Read text and structure from a Word document or the active document.
-    
+
     Args:
         filepath: Optional file path. If omitted, reads from active document in live Word.
         output_format: Format of returned content: 'markdown' (default, easiest for LLM to digest), 'text', or 'json'.
@@ -122,7 +153,7 @@ def word_read_document(
         max_paragraphs: Maximum number of paragraphs to read (useful for long docs).
     """
     try:
-        res = WordEngine.read_document(
+        res = _run(WordEngine.read_document,
             filepath=filepath,
             output_format=output_format,
             include_tables=include_tables,
@@ -147,12 +178,12 @@ def word_get_outline(
 ) -> str:
     """
     Extract the document hierarchy / table of contents outline (Headings 1-6, paragraph indices, and statistics).
-    
+
     Args:
         filepath: Optional file path. If omitted, inspects active document in live Word.
     """
     try:
-        res = WordEngine.get_outline(filepath=filepath)
+        res = _run(WordEngine.get_outline, filepath=filepath)
         return json.dumps(res, indent=2, ensure_ascii=False)
     except Exception as e:
         return f"❌ Error getting outline: {str(e)}"
@@ -168,7 +199,7 @@ def word_add_heading(
 ) -> str:
     """
     Add a heading (Level 1 to 6) to the document.
-    
+
     Args:
         text: Heading text.
         level: Heading level (1 to 6). Default: 1.
@@ -177,7 +208,7 @@ def word_add_heading(
         color: Optional hex color for heading text (e.g. '#1F497D', '#2B2B2B').
     """
     try:
-        res = WordEngine.add_heading(
+        res = _run(WordEngine.add_heading,
             text=text,
             level=level,
             filepath=filepath,
@@ -208,7 +239,7 @@ def word_add_paragraph(
 ) -> str:
     """
     Add a rich paragraph with font formatting, color, highlight, and spacing.
-    
+
     Args:
         text: Paragraph text content.
         filepath: Optional file path. If omitted, adds to active document in live Word.
@@ -226,7 +257,7 @@ def word_add_paragraph(
         space_after: Space after paragraph in points.
     """
     try:
-        res = WordEngine.add_paragraph(
+        res = _run(WordEngine.add_paragraph,
             text=text,
             filepath=filepath,
             style=style,
@@ -255,14 +286,14 @@ def word_add_bullet_list(
 ) -> str:
     """
     Add a list of items (bulleted or numbered).
-    
+
     Args:
         items: List of string items to insert.
         filepath: Optional file path. If omitted, adds to active document in live Word.
         list_type: 'bullet' (bulleted list) or 'number' (numbered 1, 2, 3 list).
     """
     try:
-        res = WordEngine.add_bullet_list(
+        res = _run(WordEngine.add_bullet_list,
             items=items,
             filepath=filepath,
             list_type=list_type
@@ -283,7 +314,7 @@ def word_add_callout_box(
 ) -> str:
     """
     Add a styled callout / alert block with light background and colored accent border.
-    
+
     Args:
         text: Callout body text.
         filepath: Optional file path. If omitted, adds to active document in live Word.
@@ -293,7 +324,7 @@ def word_add_callout_box(
         border_color: Optional custom border hex color (e.g. '#1F497D').
     """
     try:
-        res = WordEngine.add_callout_box(
+        res = _run(WordEngine.add_callout_box,
             text=text,
             filepath=filepath,
             title=title,
@@ -321,7 +352,7 @@ def word_add_table(
 ) -> str:
     """
     Add a professionally styled table with custom header fills, zebra row striping, and column widths.
-    
+
     Args:
         headers: List of column header titles (e.g. ['Task', 'Owner', 'Due Date', 'Status']).
         data: 2D list of rows and cell values.
@@ -335,7 +366,7 @@ def word_add_table(
         auto_fit: Automatically fit columns to contents (default: True).
     """
     try:
-        res = WordEngine.add_table(
+        res = _run(WordEngine.add_table,
             headers=headers,
             data=data,
             filepath=filepath,
@@ -363,7 +394,7 @@ def word_add_image(
 ) -> str:
     """
     Insert an image into the Word document with scaling, alignment, and optional figure caption.
-    
+
     Args:
         image_path: Full file path to the image (PNG, JPG, BMP, etc.).
         filepath: Optional document file path. If omitted, adds to active document in live Word.
@@ -373,7 +404,7 @@ def word_add_image(
         align: Image alignment ('center', 'left', 'right').
     """
     try:
-        res = WordEngine.add_image(
+        res = _run(WordEngine.add_image,
             image_path=image_path,
             filepath=filepath,
             width_inches=width_inches,
@@ -392,12 +423,12 @@ def word_add_page_break(
 ) -> str:
     """
     Insert a page break into the document.
-    
+
     Args:
         filepath: Optional file path. If omitted, inserts into active document in live Word.
     """
     try:
-        res = WordEngine.add_page_break(filepath=filepath)
+        res = _run(WordEngine.add_page_break, filepath=filepath)
         return json.dumps(res, indent=2, ensure_ascii=False)
     except Exception as e:
         return f"❌ Error adding page break: {str(e)}"
@@ -414,7 +445,7 @@ def word_search_and_replace(
 ) -> str:
     """
     Find and replace text across the document (paragraphs, headings, tables).
-    
+
     Args:
         find_text: The string to search for.
         replace_text: The replacement string.
@@ -424,7 +455,7 @@ def word_search_and_replace(
         replace_all: Replace all instances (default: True).
     """
     try:
-        res = WordEngine.search_and_replace(
+        res = _run(WordEngine.search_and_replace,
             find_text=find_text,
             replace_text=replace_text,
             filepath=filepath,
@@ -453,7 +484,7 @@ def word_set_header_footer(
 ) -> str:
     """
     Set custom running header, footer, and dynamic page numbering (Page X).
-    
+
     Args:
         header_text: Text to display in top header (e.g. 'Confidential Report | Q1 2026').
         footer_text: Text to display in bottom footer (e.g. 'Antigravity AI').
@@ -464,7 +495,7 @@ def word_set_header_footer(
         filepath: Optional file path. If omitted, applies to active document in live Word.
     """
     try:
-        res = WordEngine.set_header_footer(
+        res = _run(WordEngine.set_header_footer,
             header_text=header_text,
             footer_text=footer_text,
             include_page_number=include_page_number,
@@ -488,7 +519,7 @@ def word_insert_toc(
 ) -> str:
     """
     Insert an automated Table of Contents (TOC) with heading levels and page numbers.
-    
+
     Args:
         filepath: Optional file path. If omitted, inserts into active document in live Word.
         title: Title above TOC (default: 'جدول المحتويات' or 'Table of Contents').
@@ -497,7 +528,7 @@ def word_insert_toc(
         position: Insertion position: 'start' (at beginning of document) or 'end'.
     """
     try:
-        res = WordEngine.insert_toc(
+        res = _run(WordEngine.insert_toc,
             filepath=filepath,
             title=title,
             upper_heading_level=upper_heading_level,
@@ -517,14 +548,14 @@ def word_fill_template(
 ) -> str:
     """
     Render a pre-designed Word template (.docx / .dotx) by filling {{tags}} with data.
-    
+
     Args:
         template_path: Path to template docx file.
         output_path: Destination path for generated document.
         replacements: Key-value map of tags to replace (e.g. {'client_name': 'Acme Corp', 'amount': '$5,000'}).
     """
     try:
-        res = WordEngine.fill_template(
+        res = _run(WordEngine.fill_template,
             template_path=template_path,
             output_path=output_path,
             replacements=replacements
@@ -544,7 +575,7 @@ def word_add_comment(
 ) -> str:
     """
     Add a review comment / feedback annotation to a specific text string or paragraph.
-    
+
     Args:
         comment_text: The review comment note.
         target_text: Specific text phrase in the document to attach the comment to.
@@ -553,7 +584,7 @@ def word_add_comment(
         filepath: Optional file path. If omitted, comments in active document in live Word.
     """
     try:
-        res = WordEngine.add_comment(
+        res = _run(WordEngine.add_comment,
             comment_text=comment_text,
             target_text=target_text,
             paragraph_index=paragraph_index,
@@ -578,7 +609,7 @@ def word_set_page_setup(
 ) -> str:
     """
     Configure page layout: orientation (Portrait/Landscape), paper size (A4/Letter), and margins.
-    
+
     Args:
         filepath: Optional file path. If omitted, configures active document in live Word.
         orientation: 'portrait' (vertical) or 'landscape' (horizontal).
@@ -590,7 +621,7 @@ def word_set_page_setup(
         right_margin_inches: Custom right margin in inches.
     """
     try:
-        res = WordEngine.set_page_setup(
+        res = _run(WordEngine.set_page_setup,
             filepath=filepath,
             orientation=orientation,
             paper_size=paper_size,
@@ -616,7 +647,7 @@ def word_add_watermark(
 ) -> str:
     """
     Add a subtle background text watermark (e.g. 'CONFIDENTIAL', 'DRAFT', 'مسودة').
-    
+
     Args:
         text: Watermark text string.
         filepath: Optional file path. If omitted, adds to active document in live Word.
@@ -626,7 +657,7 @@ def word_add_watermark(
         diagonal: Angle diagonally across page (default: True).
     """
     try:
-        res = WordEngine.add_watermark(
+        res = _run(WordEngine.add_watermark,
             text=text,
             filepath=filepath,
             color=color,
@@ -650,13 +681,13 @@ def word_export_pdf(
 ) -> str:
     """
     Export the Word document to a high-fidelity PDF file using Microsoft Word's native engine.
-    
+
     Args:
         output_pdf_path: Target path for the generated PDF (e.g. 'E:/reports/report.pdf').
         filepath: Optional source document path. If omitted, exports active document from live Word.
     """
     try:
-        res = WordEngine.export_pdf(output_pdf_path=output_pdf_path, filepath=filepath)
+        res = _run(WordEngine.export_pdf, output_pdf_path=output_pdf_path, filepath=filepath)
         return json.dumps(res, indent=2, ensure_ascii=False)
     except Exception as e:
         return f"❌ Error exporting PDF: {str(e)}"
@@ -669,26 +700,25 @@ def word_save_document(
 ) -> str:
     """
     Save the currently active document or save it to a new file path.
-    
+
     Args:
         save_as_path: Optional new destination path to save as.
         filepath: Optional specific document file to save.
     """
     try:
-        res = WordEngine.save_document(save_as_path=save_as_path, filepath=filepath)
+        res = _run(WordEngine.save_document, save_as_path=save_as_path, filepath=filepath)
         return json.dumps(res, indent=2, ensure_ascii=False)
     except Exception as e:
         return f"❌ Error saving document: {str(e)}"
 
 
-@mcp.tool()
 def word_execute_script(
     code: str,
     filepath: Optional[str] = None
 ) -> str:
     """
     Execute arbitrary Python automation code with direct access to Word COM and python-docx objects.
-    
+
     Injected variables available in code:
       - `app`: Word.Application COM instance (win32com.client)
       - `doc`: Active Document COM instance
@@ -697,13 +727,13 @@ def word_execute_script(
       - `win32com`: win32com.client module
       - `engine`: WordEngine class
       - `Inches`, `Pt`, `RGBColor`, `WD_ALIGN_PARAGRAPH`, `WD_COLOR_INDEX`
-      
+
     Args:
         code: Python script string to execute.
         filepath: Optional target document file path.
     """
     try:
-        res = WordEngine.execute_script(code=code, filepath=filepath)
+        res = _run(WordEngine.execute_script, code=code, filepath=filepath)
         if res.get("success"):
             return f"✅ Execution Successful:\n{res.get('output')}"
         else:
@@ -712,11 +742,25 @@ def word_execute_script(
         return f"❌ Error executing script: {str(e)}"
 
 
+# Registered only when WORD_MCP_ENABLE_SCRIPT=1: it executes arbitrary Python on this machine.
+if script_execution_enabled():
+    word_execute_script = mcp.tool()(word_execute_script)
+
+
 def main():
     """Main entrypoint for CLI and script execution."""
-    mcp.run()
+    # stdout is the MCP protocol channel: log to stderr only.
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=os.environ.get("WORD_MCP_LOG", "WARNING").upper(),
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    log.info("word-mcp starting (mode=%s)", get_mode())
+    try:
+        mcp.run()
+    finally:
+        WORKER.shutdown()
 
 
 if __name__ == "__main__":
     main()
-

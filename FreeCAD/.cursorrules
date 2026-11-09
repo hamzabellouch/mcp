@@ -1,0 +1,37 @@
+# FreeCAD AI Assistant Rules & Visual Construction Protocol
+
+## Core Rules & Operational Constraints
+
+Whenever interacting with FreeCAD via the FreeCAD MCP Server:
+
+1. **In-Memory Execution (No .py files on disk)**:
+   - Execute all CAD scripts and parametric operations in-memory via the live RPC bridge.
+   - Do not write, generate, or save scratch `.py` files on disk unless the user explicitly asks for a script file.
+
+2. **Fast Mode & No Screenshots by Default**:
+   - Run in fast mode without capturing viewport screenshots.
+   - Capture and display a screenshot only when the user explicitly requests one.
+
+3. **Step-by-Step Progressive Construction (Live Animation)**:
+   - Never execute complex CAD modifications in a single unobservable jump.
+   - Always break tasks into observable visual stages:
+     - **Stage 1 (2D Sketch / Wireframe)**: Draw wireframes/reference points first and display them progressively in the 3D viewport.
+     - **Stage 2 (2D Face Formation)**: Form closed planar faces.
+     - **Stage 3 (3D Volumetric Extrusion / Pocketing)**: Extrude or cut progressively in depth stages.
+     - **Stage 4 (Finishing & Styling)**: Apply fillets, chamfers, boolean cuts, colors, and transparencies.
+
+4. **Live Animated Feedback**:
+   - When executing Python scripts in FreeCAD GUI, use `FreeCADGui.updateGui()` with short delays (`time.sleep(0.04)` to `0.15`) between geometric segments so the user observes the creation live like an interactive CAD animation.
+
+5. **Live Thinking & Visible Iteration (Trial-and-Error on Screen)**:
+   - Do not hide design reasoning or compute final polished outcomes in internal silence.
+   - Externalize iterations onto the live 3D canvas:
+     - Apply candidate colors/materials live first, observe, and adjust live.
+     - Draft preliminary dimensions/positions on the screen, then fine-tune live.
+     - Emulate an active workshop engineer experimenting, evaluating, and refining visibly.
+
+6. **Live Mechanism Animation**:
+   - For moving parts (rotors, propellers, gears, mechanisms), use `PySide.QtCore.QTimer` to attach smooth, non-blocking real-time rotation at 30-40 FPS.
+
+7. **User Override**:
+   - If the user explicitly asks for screenshots or for `.py` files, fulfill that specific request. Otherwise, adhere strictly to the in-memory, no-screenshot, step-by-step, visible-iteration default rules.

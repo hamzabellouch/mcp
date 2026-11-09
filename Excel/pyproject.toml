@@ -42,7 +42,7 @@ dependencies = [
 ]
 
 [project.scripts]
-excel-mcp = "excel_mcp_server:main"
+excel-mcp = "excel_mcp_servers:main"
 
 [project.urls]
 Homepage = "https://github.com/example/excel-mcp-server"

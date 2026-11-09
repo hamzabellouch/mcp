@@ -14,7 +14,28 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
+# The script tool is only registered when explicitly enabled; enable it for this run.
+os.environ.setdefault("WORD_MCP_ENABLE_SCRIPT", "1")
+
 import word_mcp_server as srv
+
+# Record every tool that answers with an error so the final banner is honest.
+FAILURES = []
+
+
+def _record_failures(fn):
+    def inner(*args, **kwargs):
+        out = fn(*args, **kwargs)
+        if isinstance(out, str) and out.startswith("\u274c"):
+            FAILURES.append((fn.__name__, out))
+        return out
+    inner.__name__ = fn.__name__
+    return inner
+
+
+for _name in dir(srv):
+    if _name.startswith("word_") and callable(getattr(srv, _name)):
+        setattr(srv, _name, _record_failures(getattr(srv, _name)))
 
 TEST_FILE = os.path.abspath("temp_enterprise_output.docx")
 TEST_TEMPLATE = os.path.abspath("temp_template.docx")
@@ -214,10 +235,22 @@ print(f"Document inspection complete: {len(doc.paragraphs)} paragraphs, {len(doc
             except Exception:
                 pass
 
+    # PDF export needs a real Word (COM); it is expected to fail elsewhere.
+    expected = set() if sys.platform == "win32" else {"word_export_pdf"}
+    real_failures = [(n, o) for n, o in FAILURES if n not in expected]
+
     print("\n=======================================================")
-    print("   ALL 22 WORD MCP TOOLS VERIFIED & WORKING FLAWLESSLY! ")
+    if real_failures:
+        print(f"   {len(real_failures)} TOOL CALL(S) FAILED:")
+        for name, out in real_failures:
+            print(f"   - {name}: {out[:160]}")
+        print("=======================================================")
+        return 1
+    skipped = f" (skipped on this OS: {', '.join(sorted(expected))})" if expected else ""
+    print(f"   ALL TOOL CALLS SUCCEEDED{skipped}")
     print("=======================================================")
+    return 0
 
 
 if __name__ == "__main__":
-    run_tests()
+    sys.exit(run_tests())

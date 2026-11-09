@@ -13,6 +13,7 @@ import sys
 import json
 import re
 import traceback
+import contextlib
 from typing import List, Dict, Any, Optional, Union, Tuple
 
 # Headless docx engine
@@ -24,13 +25,20 @@ from docx.enum.section import WD_SECTION, WD_ORIENT
 from docx.oxml import parse_xml, OxmlElement
 from docx.oxml.ns import nsdecls, qn
 
-# Windows COM Automation
-try:
-    import win32com.client
-    import pythoncom
-    COM_AVAILABLE = True
-except ImportError:
-    COM_AVAILABLE = False
+# Windows COM Automation + runtime helpers (single COM thread, modes, retry)
+from com_runtime import (
+    COM_AVAILABLE,
+    win32com,
+    pythoncom,
+    LiveWordError,
+    WordNotRunning,
+    WordNotReachable,
+    get_mode,
+    script_execution_enabled,
+    ensure_com,
+    com_retry,
+    word_process_exists,
+)
 
 
 # ==========================================
@@ -48,31 +56,6 @@ def parse_hex_color(hex_str: str) -> Tuple[int, int, int]:
     g = int(hex_str[2:4], 16)
     b = int(hex_str[4:6], 16)
     return r, g, b
-
-
-def cleanup_stale_lock_files(target_path: Optional[str] = None):
-    """Remove orphaned Microsoft Word ~$*.docx hidden lock files to prevent 'File In Use' dialogs."""
-    try:
-        if target_path:
-            dir_path = os.path.dirname(os.path.abspath(target_path)) if (os.path.isfile(target_path) or '.' in os.path.basename(target_path)) else os.path.abspath(target_path)
-        else:
-            dir_path = os.getcwd()
-        if os.path.exists(dir_path):
-            for fname in os.listdir(dir_path):
-                if fname.startswith("~$") and fname.endswith(".docx"):
-                    lock_file = os.path.join(dir_path, fname)
-                    try:
-                        if sys.platform == "win32":
-                            try:
-                                import ctypes
-                                ctypes.windll.kernel32.SetFileAttributesW(lock_file, 128)  # FILE_ATTRIBUTE_NORMAL
-                            except Exception:
-                                pass
-                        os.remove(lock_file)
-                    except Exception:
-                        pass
-    except Exception:
-        pass
 
 
 def hex_to_bgr_int(hex_str: str) -> int:
@@ -200,49 +183,186 @@ def set_cell_borders(cell, top=None, bottom=None, left=None, right=None):
 # Live Word COM Management
 # ==========================================
 
+def require_filepath(filepath: Optional[str]) -> str:
+    """Headless edits need an explicit file. Never invent a hidden default file."""
+    if not filepath:
+        raise ValueError(
+            "No filepath was given and there is no active document in live Word. "
+            "Pass `filepath`, or open/create a document in Word first."
+        )
+    return os.path.abspath(filepath)
+
+
 class LiveWordSession:
-    """Manages COM connection to Microsoft Word desktop application safely."""
+    """
+    Manages the COM connection to the Word instance the USER is looking at.
+
+    Design rules (these exist because of real failure modes):
+      1. ATTACH to the running instance (GetActiveObject). Never start a second one
+         while a WINWORD.EXE process exists - Dispatch() would join the user's
+         instance and a later Quit() would close the user's Word.
+      2. Only quit an instance this server launched itself, only when it is hidden
+         and holds no documents (PDF export).
+      3. Never launch an invisible Word for general tools: a hidden instance
+         silently swallows documents the user opens later.
+      4. Live failures are raised (see handle_live_failure) instead of silently
+         falling back to editing the file on disk behind Word's back.
+      5. DisplayAlerts is suppressed only for the duration of one tool call.
+    """
+
+    _saved_alerts: Optional[int] = None
+    _last_launched_by_us: bool = False
+
+    # ---- mode / failure policy -------------------------------------------------
+    @staticmethod
+    def mode() -> str:
+        return get_mode()
+
+    @staticmethod
+    def should_use_live() -> bool:
+        mode = get_mode()
+        if mode == "headless":
+            return False
+        if not COM_AVAILABLE:
+            if mode == "live":
+                raise LiveWordError(
+                    "WORD_MCP_MODE=live requires Windows with pywin32 installed (pip install pywin32)."
+                )
+            return False
+        return True
+
+    @staticmethod
+    def handle_live_failure(exc: BaseException) -> None:
+        """
+        Called from `except` blocks around live COM code.
+        Returns normally only when falling back to headless editing is SAFE
+        (Word not running / file not open yet, and mode is not 'live').
+        Otherwise raises LiveWordError so the agent and the user see the problem.
+        """
+        benign = isinstance(exc, (WordNotRunning, FileNotFoundError))
+        if benign and get_mode() != "live":
+            return
+        if isinstance(exc, LiveWordError):
+            raise exc
+        if isinstance(exc, WordNotRunning):
+            raise LiveWordError(
+                "Microsoft Word is not running (WORD_MCP_MODE=live). Start Word or use WORD_MCP_MODE=auto."
+            ) from exc
+        raise LiveWordError(
+            f"Live Word operation failed ({type(exc).__name__}: {exc}). "
+            "The document file was NOT modified on disk to avoid conflicting with the open Word window. "
+            "Check that Word is idle (no open dialog) and retry."
+        ) from exc
+
+    # ---- attach / launch -------------------------------------------------------
+    @staticmethod
+    def _attach():
+        """Return the running Word.Application COM object, or None."""
+        if not COM_AVAILABLE:
+            return None
+        ensure_com()
+        try:
+            return win32com.client.GetActiveObject("Word.Application")
+        except Exception:
+            return None
 
     @staticmethod
     def is_word_running() -> bool:
-        """Check if Microsoft Word is running without launching a new instance."""
-        if not COM_AVAILABLE:
-            return False
-        try:
-            pythoncom.CoInitialize()
-            app = win32com.client.GetActiveObject("Word.Application")
-            return app is not None
-        except Exception:
-            return False
+        """True if Word is running (reachable via COM or at least as a process)."""
+        return LiveWordSession._attach() is not None or word_process_exists()
 
-    @staticmethod
-    def get_app(create_if_missing: bool = True, visible: bool = True):
-        """Get running Word COM instance or launch one if create_if_missing=True."""
+    @classmethod
+    def get_app(cls, create_if_missing: bool = True, visible: bool = True, hidden_ok: bool = False):
+        """
+        Attach to the running Word. Launch one only if no Word process exists at all.
+
+        visible=False is honoured only with hidden_ok=True (PDF export, which quits
+        the instance afterwards). Everywhere else a launched Word is always visible.
+        """
         if not COM_AVAILABLE:
-            raise RuntimeError("pywin32 (win32com) is not installed or unavailable.")
-        pythoncom.CoInitialize()
-        try:
-            # First try to get already running instance
-            app = win32com.client.GetActiveObject("Word.Application")
-            if visible and hasattr(app, "Visible") and not app.Visible:
-                app.Visible = True
-            if hasattr(app, "DisplayAlerts"):
-                app.DisplayAlerts = 0
+            raise LiveWordError("pywin32 (win32com) is not installed or unavailable.")
+        cls._last_launched_by_us = False
+
+        app = cls._attach()
+        if app is not None:
             if visible:
+                try:
+                    if not app.Visible:
+                        app.Visible = True
+                except Exception:
+                    pass
                 try:
                     app.Activate()
                 except Exception:
                     pass
+            cls._suppress_alerts(app)
             return app
+
+        if word_process_exists():
+            raise WordNotReachable(
+                "Word is running but COM cannot attach to it. Common causes: Word is elevated "
+                "('Run as administrator') while this server is not (or the reverse); Word is still "
+                "starting; or a start-up/recovery dialog is open. No second instance was launched, "
+                "to avoid interfering with your session. Match privilege levels or close the dialog."
+            )
+
+        if not create_if_missing:
+            raise WordNotRunning("Microsoft Word is not currently running.")
+
+        app = com_retry(win32com.client.Dispatch, "Word.Application")
+        cls._last_launched_by_us = True
+        try:
+            app.Visible = True if not hidden_ok else bool(visible)
         except Exception:
-            if create_if_missing:
-                app = win32com.client.Dispatch("Word.Application")
-                if hasattr(app, "Visible"):
-                    app.Visible = visible
-                if hasattr(app, "DisplayAlerts"):
-                    app.DisplayAlerts = 0
-                return app
-            raise RuntimeError("Microsoft Word is not currently running.")
+            pass
+        cls._suppress_alerts(app)
+        return app
+
+    @classmethod
+    def launched_by_us(cls) -> bool:
+        """Whether the most recent get_app() call started a brand-new Word process."""
+        return cls._last_launched_by_us
+
+    # ---- alerts ----------------------------------------------------------------
+    @classmethod
+    def _suppress_alerts(cls, app) -> None:
+        try:
+            if cls._saved_alerts is None:
+                cls._saved_alerts = int(app.DisplayAlerts)
+            app.DisplayAlerts = 0  # wdAlertsNone
+        except Exception:
+            pass
+
+    @classmethod
+    def restore_ui(cls) -> None:
+        """Give DisplayAlerts back to the user. Call after every tool invocation."""
+        if cls._saved_alerts is None:
+            return
+        saved, cls._saved_alerts = cls._saved_alerts, None
+        app = cls._attach()
+        if app is None:
+            return
+        try:
+            app.DisplayAlerts = saved
+        except Exception:
+            pass
+
+    # ---- documents -------------------------------------------------------------
+    @staticmethod
+    def find_open_document(app, abs_path: str):
+        """Return the already-open document whose path equals abs_path, else None."""
+        target = os.path.abspath(abs_path).lower()
+        try:
+            for doc in app.Documents:
+                try:
+                    doc_path = getattr(doc, "FullName", "")
+                    if doc_path and os.path.abspath(doc_path).lower() == target:
+                        return doc
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
 
     @staticmethod
     def get_document(app, filepath: Optional[str] = None, create_if_empty: bool = True):
@@ -251,40 +371,32 @@ class LiveWordSession:
             return None
         if filepath:
             abs_path = os.path.abspath(filepath)
-            try:
-                for doc in app.Documents:
-                    try:
-                        doc_path = getattr(doc, "FullName", "")
-                        if doc_path and os.path.abspath(doc_path).lower() == abs_path.lower():
-                            doc.Activate()
-                            return doc
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            doc = LiveWordSession.find_open_document(app, abs_path)
+            if doc is not None:
+                com_retry(doc.Activate)
+                return doc
 
             if os.path.exists(abs_path):
-                doc = app.Documents.Open(abs_path, ConfirmConversions=False, ReadOnly=False, AddToRecentFiles=False)
-                doc.Activate()
+                doc = com_retry(
+                    app.Documents.Open, abs_path, ConfirmConversions=False, ReadOnly=False, AddToRecentFiles=False
+                )
+                com_retry(doc.Activate)
                 return doc
             elif create_if_empty:
-                doc = app.Documents.Add()
-                doc.Activate()
+                doc = com_retry(app.Documents.Add)
+                com_retry(doc.Activate)
                 return doc
             else:
                 raise FileNotFoundError(f"Document file not found: {abs_path}")
         else:
-            try:
-                if app.Documents.Count > 0:
-                    doc = app.ActiveDocument
-                    doc.Activate()
-                    return doc
-                elif create_if_empty:
-                    doc = app.Documents.Add()
-                    doc.Activate()
-                    return doc
-            except Exception:
-                pass
+            if com_retry(lambda: app.Documents.Count) > 0:
+                doc = com_retry(lambda: app.ActiveDocument)
+                com_retry(doc.Activate)
+                return doc
+            elif create_if_empty:
+                doc = com_retry(app.Documents.Add)
+                com_retry(doc.Activate)
+                return doc
             return None
 
 
@@ -299,48 +411,61 @@ class WordEngine:
 
     @classmethod
     def get_status(cls) -> Dict[str, Any]:
-        """Check live status of Microsoft Word."""
+        """Check live status of Microsoft Word (never launches Word)."""
         status = {
+            "mode": get_mode(),
             "word_running": False,
+            "word_process_found": False,
             "com_available": COM_AVAILABLE,
             "version": None,
             "open_documents": [],
             "active_document": None,
-            "active_document_path": None
+            "active_document_path": None,
+            "hint": None,
         }
         if not COM_AVAILABLE:
+            status["hint"] = "pywin32 is not installed: only headless (file) editing is available."
             return status
 
+        app = LiveWordSession._attach()
+        if app is None:
+            status["word_process_found"] = word_process_exists()
+            if status["word_process_found"]:
+                status["hint"] = (
+                    "A Word process exists but COM cannot attach to it (elevation mismatch, "
+                    "start-up dialog, or Word still loading)."
+                )
+            return status
+
+        status["word_running"] = True
+        status["word_process_found"] = True
         try:
-            pythoncom.CoInitialize()
-            app = win32com.client.GetActiveObject("Word.Application")
-            status["word_running"] = True
             status["version"] = str(getattr(app, "Version", ""))
-            
-            docs = []
-            try:
-                for doc in app.Documents:
-                    try:
-                        docs.append({
-                            "name": getattr(doc, "Name", ""),
-                            "path": getattr(doc, "FullName", ""),
-                            "saved": getattr(doc, "Saved", True)
-                        })
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            status["open_documents"] = docs
-            
-            try:
-                if app.Documents.Count > 0 and app.ActiveDocument:
-                    status["active_document"] = app.ActiveDocument.Name
-                    try:
-                        status["active_document_path"] = app.ActiveDocument.FullName
-                    except Exception:
-                        status["active_document_path"] = ""
-            except Exception:
-                pass
+        except Exception:
+            pass
+
+        docs = []
+        try:
+            for doc in app.Documents:
+                try:
+                    docs.append({
+                        "name": getattr(doc, "Name", ""),
+                        "path": getattr(doc, "FullName", ""),
+                        "saved": getattr(doc, "Saved", True),
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        status["open_documents"] = docs
+
+        try:
+            if app.Documents.Count > 0 and app.ActiveDocument:
+                status["active_document"] = app.ActiveDocument.Name
+                try:
+                    status["active_document_path"] = app.ActiveDocument.FullName
+                except Exception:
+                    status["active_document_path"] = ""
         except Exception:
             pass
         return status
@@ -361,12 +486,10 @@ class WordEngine:
         if filepath:
             abs_path = os.path.abspath(filepath)
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-            cleanup_stale_lock_files(abs_path)
         else:
             abs_path = None
-            cleanup_stale_lock_files()
 
-        if COM_AVAILABLE and visible:
+        if visible and LiveWordSession.should_use_live():
             try:
                 app = LiveWordSession.get_app(create_if_missing=True, visible=True)
                 doc = app.Documents.Add()
@@ -421,13 +544,13 @@ class WordEngine:
                         "doc_name": doc.Name,
                         "title": title
                     }
-            except Exception:
-                pass
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
         # Headless docx creation
         doc = docx.Document()
         styles = [s.name for s in doc.styles]
-        
+
         if title:
             title_style = "Title" if "Title" in styles else None
             p_title = doc.add_paragraph(style=title_style)
@@ -489,7 +612,6 @@ class WordEngine:
         if not os.path.exists(abs_path):
             raise FileNotFoundError(f"File not found: {abs_path}")
 
-        cleanup_stale_lock_files(abs_path)
 
         if visible and sys.platform == "win32" and not COM_AVAILABLE:
             try:
@@ -497,21 +619,25 @@ class WordEngine:
             except Exception:
                 pass
 
-        if COM_AVAILABLE:
+        if LiveWordSession.should_use_live():
             try:
-                app = LiveWordSession.get_app(create_if_missing=True, visible=visible)
-                doc = app.Documents.Open(abs_path, ReadOnly=read_only)
-                if visible:
-                    doc.Activate()
+                # NOTE: `visible` is intentionally not used to hide Word: a hidden Word
+                # instance would swallow documents the user opens later.
+                app = LiveWordSession.get_app(create_if_missing=True, visible=True)
+                doc = LiveWordSession.find_open_document(app, abs_path)
+                already_open = doc is not None
+                if not already_open:
+                    doc = com_retry(app.Documents.Open, abs_path, ReadOnly=read_only)
+                com_retry(doc.Activate)
                 return {
                     "mode": "live_com",
-                    "status": "opened_live_on_screen",
+                    "status": "already_open_activated" if already_open else "opened_live_on_screen",
                     "doc_name": doc.Name,
                     "filepath": abs_path,
                     "read_only": read_only
                 }
-            except Exception:
-                pass
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
         doc = docx.Document(abs_path)
         return {
@@ -533,7 +659,8 @@ class WordEngine:
         """
         Read text and structure from a Word document or the active document.
         """
-        if not filepath and COM_AVAILABLE:
+        temp_copy = None
+        if not filepath and LiveWordSession.should_use_live():
             try:
                 app = LiveWordSession.get_app(create_if_missing=False)
                 if app.Documents.Count > 0:
@@ -547,11 +674,44 @@ class WordEngine:
                             "text": text_content.replace("\r", "\n")
                         }
                     else:
-                        temp_path = os.path.join(os.environ.get("TEMP", "."), f"_temp_mcp_read_{os.getpid()}.docx")
-                        doc.SaveCopyAs(temp_path)
-                        filepath = temp_path
-            except Exception:
-                pass
+                        temp_path = os.path.join(
+                            os.environ.get("TEMP", "."), f"_temp_mcp_read_{os.getpid()}.docx"
+                        )
+                        try:
+                            doc.SaveCopyAs(temp_path)
+                            filepath = temp_path
+                            temp_copy = temp_path
+                        except Exception:
+                            # SaveCopyAs is not available in every Word build:
+                            # read the live paragraphs directly instead of touching the file.
+                            md_live, words_live = [], 0
+                            for para in doc.Paragraphs:
+                                if max_paragraphs and len(md_live) >= max_paragraphs:
+                                    break
+                                txt = para.Range.Text.replace("\x07", "").strip("\r\n ").strip()
+                                if not txt:
+                                    continue
+                                try:
+                                    level = int(para.OutlineLevel)
+                                except Exception:
+                                    level = 10
+                                md_live.append(("#" * level + " " if 1 <= level <= 9 else "") + txt)
+                                words_live += len(txt.split())
+                            try:
+                                tables_live = int(doc.Tables.Count)
+                            except Exception:
+                                tables_live = 0
+                            return {
+                                "document_name": doc.Name,
+                                "filepath": getattr(doc, "FullName", ""),
+                                "mode": "live_com",
+                                "total_paragraphs": len(md_live),
+                                "total_tables": tables_live,
+                                "total_words": words_live,
+                                "markdown": "\n\n".join(md_live),
+                            }
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
         if not filepath:
             raise ValueError("No filepath provided and no active document found in Microsoft Word.")
@@ -561,6 +721,11 @@ class WordEngine:
             raise FileNotFoundError(f"File not found: {abs_path}")
 
         doc = docx.Document(abs_path)
+        if temp_copy:
+            try:
+                os.remove(temp_copy)  # fully loaded in memory; do not leave temp files behind
+            except OSError:
+                pass
         paragraphs_data = []
         md_lines = []
         plain_lines = []
@@ -569,14 +734,14 @@ class WordEngine:
         for p in doc.paragraphs:
             if max_paragraphs and para_count >= max_paragraphs:
                 break
-            
+
             p_text = p.text.strip()
             if not p_text and not p.runs:
                 continue
 
             para_count += 1
             style_name = p.style.name if p.style else "Normal"
-            
+
             runs_data = []
             for r in p.runs:
                 runs_data.append({
@@ -651,7 +816,7 @@ class WordEngine:
                 tbl_rows = []
                 for row in tbl.rows:
                     tbl_rows.append([cell.text.strip().replace("\n", " ") for cell in row.cells])
-                
+
                 tables_data.append({
                     "table_index": t_idx,
                     "rows_count": len(tbl.rows),
@@ -737,8 +902,8 @@ class WordEngine:
     ) -> Dict[str, Any]:
         """Add a heading (Level 1 to 6) to the document."""
         level = max(1, min(6, int(level)))
-        
-        if COM_AVAILABLE:
+
+        if LiveWordSession.should_use_live():
             try:
                 app = LiveWordSession.get_app(create_if_missing=False)
                 doc = LiveWordSession.get_document(app, filepath, create_if_empty=False)
@@ -764,10 +929,10 @@ class WordEngine:
                         "level": level,
                         "text": text
                     }
-            except Exception:
-                pass
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
-        abs_path = os.path.abspath(filepath) if filepath else os.path.abspath("document.docx")
+        abs_path = require_filepath(filepath)
         doc = docx.Document(abs_path) if os.path.exists(abs_path) else docx.Document()
 
         heading = doc.add_heading(text, level=level)
@@ -806,7 +971,7 @@ class WordEngine:
         space_after: Optional[float] = None
     ) -> Dict[str, Any]:
         """Add a rich paragraph with font formatting, color, highlight, and spacing."""
-        if COM_AVAILABLE:
+        if LiveWordSession.should_use_live():
             try:
                 app = LiveWordSession.get_app(create_if_missing=False)
                 doc = LiveWordSession.get_document(app, filepath, create_if_empty=False)
@@ -838,7 +1003,7 @@ class WordEngine:
                         sel.ParagraphFormat.SpaceBefore = space_before
                     if line_spacing is not None:
                         sel.ParagraphFormat.LineSpacing = line_spacing * 12
-                    
+
                     sel.TypeText(text)
                     sel.Font.Reset()
                     if filepath and hasattr(doc, "Save"):
@@ -849,10 +1014,10 @@ class WordEngine:
                         "doc_name": doc.Name,
                         "text_length": len(text)
                     }
-            except Exception:
-                pass
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
-        abs_path = os.path.abspath(filepath) if filepath else os.path.abspath("document.docx")
+        abs_path = require_filepath(filepath)
         doc = docx.Document(abs_path) if os.path.exists(abs_path) else docx.Document()
 
         p = doc.add_paragraph(style=style if style and style in [s.name for s in doc.styles] else None)
@@ -902,8 +1067,8 @@ class WordEngine:
     ) -> Dict[str, Any]:
         """Add a bulleted or numbered list."""
         style_name = "List Number" if list_type.lower() in ("number", "numbered", "1", "numeric") else "List Bullet"
-        
-        if COM_AVAILABLE:
+
+        if LiveWordSession.should_use_live():
             try:
                 app = LiveWordSession.get_app(create_if_missing=False)
                 doc = LiveWordSession.get_document(app, filepath, create_if_empty=False)
@@ -927,10 +1092,10 @@ class WordEngine:
                         "items_count": len(items),
                         "list_type": list_type
                     }
-            except Exception:
-                pass
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
-        abs_path = os.path.abspath(filepath) if filepath else os.path.abspath("document.docx")
+        abs_path = require_filepath(filepath)
         doc = docx.Document(abs_path) if os.path.exists(abs_path) else docx.Document()
 
         for item in items:
@@ -971,7 +1136,7 @@ class WordEngine:
         final_border = border_color or theme["border"]
         final_title = title if title is not None else f"{theme['icon']}{theme['title']}"
 
-        if COM_AVAILABLE:
+        if LiveWordSession.should_use_live():
             try:
                 app = LiveWordSession.get_app(create_if_missing=False)
                 doc = LiveWordSession.get_document(app, filepath, create_if_empty=False)
@@ -982,21 +1147,21 @@ class WordEngine:
                     tbl = doc.Tables.Add(Range=sel.Range, NumRows=1, NumColumns=1)
                     cell = tbl.Cell(1, 1)
                     cell.Shading.BackgroundPatternColor = hex_to_bgr_int(final_bg)
-                    
+
                     cell.Borders(-1).LineStyle = 0  # wdBorderTop = -1
                     cell.Borders(-3).LineStyle = 0  # wdBorderBottom = -3
                     cell.Borders(-4).LineStyle = 0  # wdBorderRight = -4
                     cell.Borders(-2).LineStyle = 1  # wdBorderLeft = -2
                     cell.Borders(-2).LineWidth = 24 # 3.0 pt
                     cell.Borders(-2).Color = hex_to_bgr_int(final_border)
-                    
+
                     cell_range = cell.Range
                     cell_range.Text = (final_title + "\n" if final_title else "") + text
                     if final_title:
                         first_line = cell.Range.Paragraphs(1).Range
                         first_line.Font.Bold = True
                         first_line.Font.Color = hex_to_bgr_int(final_border)
-                    
+
                     sel.EndKey(Unit=6)
                     sel.TypeParagraph()
                     if filepath and hasattr(doc, "Save"):
@@ -1008,10 +1173,10 @@ class WordEngine:
                         "box_type": box_type,
                         "title": final_title
                     }
-            except Exception:
-                pass
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
-        abs_path = os.path.abspath(filepath) if filepath else os.path.abspath("document.docx")
+        abs_path = require_filepath(filepath)
         doc = docx.Document(abs_path) if os.path.exists(abs_path) else docx.Document()
 
         table = doc.add_table(rows=1, cols=1)
@@ -1037,7 +1202,7 @@ class WordEngine:
 
         set_cell_background(cell, final_bg)
         set_cell_margins(cell, top_dpt=140, bottom_dpt=140, left_dpt=200, right_dpt=160)
-        
+
         # Left border for LTR, Right border if primary language is Arabic
         border_side = "right" if is_arabic_text(text) else "left"
         border_spec = {"val": "single", "sz": "24", "color": final_border}
@@ -1051,7 +1216,7 @@ class WordEngine:
         p.paragraph_format.space_after = Pt(4) if text else Pt(0)
         if is_arabic_text(text) or (final_title and is_arabic_text(final_title)):
             p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        
+
         if final_title:
             run_title = p.add_run(final_title + "\n")
             run_title.font.name = "Segoe UI"
@@ -1098,7 +1263,7 @@ class WordEngine:
         num_cols = len(headers) if headers else (len(data[0]) if data else 1)
         num_rows = (1 if headers else 0) + len(data)
 
-        if COM_AVAILABLE:
+        if LiveWordSession.should_use_live():
             try:
                 app = LiveWordSession.get_app(create_if_missing=False)
                 doc = LiveWordSession.get_document(app, filepath, create_if_empty=False)
@@ -1107,7 +1272,7 @@ class WordEngine:
                     sel.EndKey(Unit=6)
                     sel.TypeParagraph()
                     tbl = doc.Tables.Add(Range=sel.Range, NumRows=num_rows, NumColumns=num_cols)
-                    
+
                     row_offset = 1
                     if headers:
                         for c_i, h_text in enumerate(headers, 1):
@@ -1150,10 +1315,10 @@ class WordEngine:
                         "rows": num_rows,
                         "cols": num_cols
                     }
-            except Exception:
-                pass
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
-        abs_path = os.path.abspath(filepath) if filepath else os.path.abspath("document.docx")
+        abs_path = require_filepath(filepath)
         doc = docx.Document(abs_path) if os.path.exists(abs_path) else docx.Document()
 
         table = doc.add_table(rows=num_rows, cols=num_cols)
@@ -1259,7 +1424,7 @@ class WordEngine:
         if not os.path.exists(abs_img_path):
             raise FileNotFoundError(f"Image file not found: {abs_img_path}")
 
-        if COM_AVAILABLE:
+        if LiveWordSession.should_use_live():
             try:
                 app = LiveWordSession.get_app(create_if_missing=False)
                 doc = LiveWordSession.get_document(app, filepath, create_if_empty=False)
@@ -1289,10 +1454,10 @@ class WordEngine:
                         "doc_name": doc.Name,
                         "image": abs_img_path
                     }
-            except Exception:
-                pass
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
-        abs_path = os.path.abspath(filepath) if filepath else os.path.abspath("document.docx")
+        abs_path = require_filepath(filepath)
         doc = docx.Document(abs_path) if os.path.exists(abs_path) else docx.Document()
 
         p = doc.add_paragraph()
@@ -1336,7 +1501,7 @@ class WordEngine:
     @classmethod
     def add_page_break(cls, filepath: Optional[str] = None) -> Dict[str, Any]:
         """Insert a page break."""
-        if COM_AVAILABLE:
+        if LiveWordSession.should_use_live():
             try:
                 app = LiveWordSession.get_app(create_if_missing=False)
                 doc = LiveWordSession.get_document(app, filepath, create_if_empty=False)
@@ -1347,10 +1512,10 @@ class WordEngine:
                     if filepath and hasattr(doc, "Save"):
                         doc.Save()
                     return {"mode": "live_com", "status": "page_break_added_live", "doc_name": doc.Name}
-            except Exception:
-                pass
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
-        abs_path = os.path.abspath(filepath) if filepath else os.path.abspath("document.docx")
+        abs_path = require_filepath(filepath)
         doc = docx.Document(abs_path) if os.path.exists(abs_path) else docx.Document()
         doc.add_page_break()
         doc.save(abs_path)
@@ -1367,7 +1532,7 @@ class WordEngine:
         replace_all: bool = True
     ) -> Dict[str, Any]:
         """Search and replace text across document."""
-        if COM_AVAILABLE:
+        if LiveWordSession.should_use_live():
             try:
                 app = LiveWordSession.get_app(create_if_missing=False)
                 doc = LiveWordSession.get_document(app, filepath, create_if_empty=False)
@@ -1381,7 +1546,7 @@ class WordEngine:
                     find_obj.Wrap = 1  # wdFindContinue
                     find_obj.MatchCase = match_case
                     find_obj.MatchWholeWord = match_whole_word
-                    
+
                     replace_const = 2 if replace_all else 1
                     success = find_obj.Execute(Replace=replace_const)
                     if filepath and hasattr(doc, "Save"):
@@ -1394,10 +1559,10 @@ class WordEngine:
                         "replace_text": replace_text,
                         "success": bool(success)
                     }
-            except Exception:
-                pass
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
-        abs_path = os.path.abspath(filepath) if filepath else os.path.abspath("document.docx")
+        abs_path = require_filepath(filepath)
         if not os.path.exists(abs_path):
             raise FileNotFoundError(f"File not found: {abs_path}")
 
@@ -1473,7 +1638,7 @@ class WordEngine:
         """
         Set custom running header, footer, and dynamic page numbering.
         """
-        if COM_AVAILABLE:
+        if LiveWordSession.should_use_live():
             try:
                 app = LiveWordSession.get_app(create_if_missing=False)
                 doc = LiveWordSession.get_document(app, filepath, create_if_empty=False)
@@ -1481,7 +1646,7 @@ class WordEngine:
                     for s_idx in range(1, doc.Sections.Count + 1):
                         sec = doc.Sections(s_idx)
                         sec.PageSetup.DifferentFirstPageHeaderFooter = different_first_page
-                        
+
                         if header_text is not None:
                             hdr = sec.Headers(1)
                             hdr.Range.Text = header_text
@@ -1510,15 +1675,15 @@ class WordEngine:
                         "footer": footer_text,
                         "page_number": include_page_number
                     }
-            except Exception:
-                pass
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
-        abs_path = os.path.abspath(filepath) if filepath else os.path.abspath("document.docx")
+        abs_path = require_filepath(filepath)
         doc = docx.Document(abs_path) if os.path.exists(abs_path) else docx.Document()
 
         for section in doc.sections:
             section.different_first_page_header_footer = different_first_page
-            
+
             if header_text is not None:
                 hdr = section.header
                 p_h = hdr.paragraphs[0]
@@ -1539,7 +1704,7 @@ class WordEngine:
                     r_f.font.name = "Segoe UI"
                     r_f.font.size = Pt(9)
                     r_f.font.color.rgb = hex_to_rgb_color("#7F7F7F")
-                
+
                 if include_page_number:
                     fld = parse_xml(
                         f'<w:fldSimple {nsdecls("w")} w:instr="PAGE">'
@@ -1570,7 +1735,7 @@ class WordEngine:
         """
         Insert an automated Table of Contents (TOC) with page references and heading levels.
         """
-        if COM_AVAILABLE:
+        if LiveWordSession.should_use_live():
             try:
                 app = LiveWordSession.get_app(create_if_missing=False)
                 doc = LiveWordSession.get_document(app, filepath, create_if_empty=False)
@@ -1580,7 +1745,7 @@ class WordEngine:
                         sel.HomeKey(Unit=6)
                     else:
                         sel.EndKey(Unit=6)
-                    
+
                     if title:
                         sel.Style = "Heading 1"
                         sel.TypeText(title + "\n")
@@ -1605,10 +1770,10 @@ class WordEngine:
                         "doc_name": doc.Name,
                         "title": title
                     }
-            except Exception:
-                pass
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
-        abs_path = os.path.abspath(filepath) if filepath else os.path.abspath("document.docx")
+        abs_path = require_filepath(filepath)
         doc = docx.Document(abs_path) if os.path.exists(abs_path) else docx.Document()
 
         # Build TOC paragraph
@@ -1713,7 +1878,7 @@ class WordEngine:
         """
         Add a review comment to a specific phrase or paragraph.
         """
-        if COM_AVAILABLE:
+        if LiveWordSession.should_use_live():
             try:
                 app = LiveWordSession.get_app(create_if_missing=False)
                 doc = LiveWordSession.get_document(app, filepath, create_if_empty=False)
@@ -1725,10 +1890,10 @@ class WordEngine:
                         find_obj.Text = target_text
                         if find_obj.Execute():
                             target_range = find_obj.Parent
-                    
+
                     if target_range is None and paragraph_index and paragraph_index <= doc.Paragraphs.Count:
                         target_range = doc.Paragraphs(paragraph_index).Range
-                    
+
                     if target_range is None:
                         target_range = doc.Content.Paragraphs(1).Range if doc.Content.Paragraphs.Count > 0 else doc.Content
 
@@ -1752,12 +1917,12 @@ class WordEngine:
                         "comment": comment_text,
                         "target_text": target_text
                     }
-            except Exception:
-                pass
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
-        abs_path = os.path.abspath(filepath) if filepath else os.path.abspath("document.docx")
+        abs_path = require_filepath(filepath)
         doc = docx.Document(abs_path) if os.path.exists(abs_path) else docx.Document()
-        
+
         # Locate insertion target
         target_para = None
         if target_text:
@@ -1780,12 +1945,12 @@ class WordEngine:
         r_author.font.bold = True
         r_author.font.size = Pt(9.5)
         r_author.font.color.rgb = hex_to_rgb_color("#C00000")
-        
+
         r_txt = p_note.add_run(comment_text)
         r_txt.font.italic = True
         r_txt.font.size = Pt(9.5)
         r_txt.font.color.rgb = hex_to_rgb_color("#595959")
-        
+
         doc.save(abs_path)
         return {
             "mode": "headless_docx",
@@ -1823,7 +1988,7 @@ class WordEngine:
             left_margin_inches = left_margin_inches or p_left
             right_margin_inches = right_margin_inches or p_right
 
-        if COM_AVAILABLE:
+        if LiveWordSession.should_use_live():
             try:
                 app = LiveWordSession.get_app(create_if_missing=False)
                 doc = LiveWordSession.get_document(app, filepath, create_if_empty=False)
@@ -1858,10 +2023,10 @@ class WordEngine:
                         "orientation": orientation,
                         "paper_size": paper_size
                     }
-            except Exception:
-                pass
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
-        abs_path = os.path.abspath(filepath) if filepath else os.path.abspath("document.docx")
+        abs_path = require_filepath(filepath)
         doc = docx.Document(abs_path) if os.path.exists(abs_path) else docx.Document()
 
         for sec in doc.sections:
@@ -1916,7 +2081,7 @@ class WordEngine:
         """
         Add a background text watermark (e.g. 'CONFIDENTIAL', 'DRAFT', 'مسودة').
         """
-        if COM_AVAILABLE:
+        if LiveWordSession.should_use_live():
             try:
                 app = LiveWordSession.get_app(create_if_missing=False)
                 doc = LiveWordSession.get_document(app, filepath, create_if_empty=False)
@@ -1929,7 +2094,7 @@ class WordEngine:
                     shape.Line.Visible = False
                     if diagonal:
                         shape.Rotation = -45
-                    
+
                     if filepath and hasattr(doc, "Save"):
                         doc.Save()
                     return {
@@ -1938,17 +2103,17 @@ class WordEngine:
                         "doc_name": doc.Name,
                         "watermark_text": text
                     }
-            except Exception:
-                pass
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
-        abs_path = os.path.abspath(filepath) if filepath else os.path.abspath("document.docx")
+        abs_path = require_filepath(filepath)
         doc = docx.Document(abs_path) if os.path.exists(abs_path) else docx.Document()
 
         sec = doc.sections[0]
         header = sec.header
         p = header.paragraphs[0]
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        
+
         # Add high-fidelity VML watermark shape to header in OpenXML
         rot = "-45" if diagonal else "0"
         hex_c = clean_hex(color)
@@ -2010,26 +2175,23 @@ class WordEngine:
         os.makedirs(os.path.dirname(abs_pdf_path), exist_ok=True)
 
         if not COM_AVAILABLE:
-            raise RuntimeError("Live Microsoft Word COM is required to export high-fidelity PDF documents.")
+            raise LiveWordError("Live Microsoft Word COM (pywin32) is required to export high-fidelity PDF documents.")
 
-        was_running = LiveWordSession.is_word_running()
-        app = LiveWordSession.get_app(create_if_missing=True, visible=False)
+        # Attach to the user's Word if there is one. A hidden instance is launched only
+        # when NO Word process exists, and only that instance is ever quit afterwards.
+        app = LiveWordSession.get_app(create_if_missing=True, visible=False, hidden_ok=True)
+        launched_here = LiveWordSession.launched_by_us()
         doc = None
         doc_opened_here = False
 
         try:
             if filepath:
                 abs_path = os.path.abspath(filepath)
-                # Check if already open
-                for d in app.Documents:
-                    try:
-                        if os.path.abspath(d.FullName).lower() == abs_path.lower():
-                            doc = d
-                            break
-                    except Exception:
-                        pass
+                doc = LiveWordSession.find_open_document(app, abs_path)
                 if not doc:
-                    doc = app.Documents.Open(abs_path, ConfirmConversions=False, ReadOnly=True, AddToRecentFiles=False)
+                    doc = com_retry(
+                        app.Documents.Open, abs_path, ConfirmConversions=False, ReadOnly=True, AddToRecentFiles=False
+                    )
                     doc_opened_here = True
             else:
                 if app.Documents.Count > 0:
@@ -2057,9 +2219,11 @@ class WordEngine:
                     doc.Close(SaveChanges=False)
                 except Exception:
                     pass
-            if not was_running and app:
+            if launched_here and app:
                 try:
-                    app.Quit()
+                    # Never close a Word the user could be using: only our own, now-empty instance.
+                    if app.Documents.Count == 0:
+                        app.Quit()
                 except Exception:
                     pass
 
@@ -2070,7 +2234,7 @@ class WordEngine:
         filepath: Optional[str] = None
     ) -> Dict[str, Any]:
         """Save the document or save it to a new location."""
-        if COM_AVAILABLE:
+        if LiveWordSession.should_use_live():
             try:
                 app = LiveWordSession.get_app(create_if_missing=False)
                 doc = LiveWordSession.get_document(app, filepath, create_if_empty=False)
@@ -2083,8 +2247,8 @@ class WordEngine:
                     else:
                         doc.Save()
                         return {"mode": "live_com", "status": "saved", "filepath": getattr(doc, "FullName", doc.Name)}
-            except Exception:
-                pass
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
         if filepath:
             abs_path = os.path.abspath(filepath)
@@ -2102,17 +2266,22 @@ class WordEngine:
         code: str,
         filepath: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Execute arbitrary Python automation code."""
+        """Execute arbitrary Python automation code (disabled unless WORD_MCP_ENABLE_SCRIPT=1)."""
+        if not script_execution_enabled():
+            raise PermissionError(
+                "word_execute_script is disabled. It runs arbitrary Python on this machine. "
+                "Set the environment variable WORD_MCP_ENABLE_SCRIPT=1 for the MCP server to enable it."
+            )
         app = None
         doc = None
         docx_doc = None
 
-        if COM_AVAILABLE:
+        if LiveWordSession.should_use_live():
             try:
                 app = LiveWordSession.get_app(create_if_missing=False)
                 doc = LiveWordSession.get_document(app, filepath, create_if_empty=False)
-            except Exception:
-                pass
+            except Exception as _live_exc:
+                LiveWordSession.handle_live_failure(_live_exc)
 
         if filepath and os.path.exists(os.path.abspath(filepath)):
             try:
@@ -2120,9 +2289,7 @@ class WordEngine:
             except Exception:
                 pass
 
-        old_stdout = sys.stdout
         redirected_output = io.StringIO()
-        sys.stdout = redirected_output
 
         execution_scope = {
             "app": app,
@@ -2150,17 +2317,19 @@ class WordEngine:
         }
 
         try:
-            exec(code, execution_scope)
-            sys.stdout = old_stdout
+            # redirect_stdout always restores the real stdout (the MCP protocol channel),
+            # even if the script raises or calls sys.exit().
+            with contextlib.redirect_stdout(redirected_output):
+                exec(code, execution_scope)
             return {
                 "success": True,
                 "output": redirected_output.getvalue() or "Script executed successfully without output."
             }
         except Exception as e:
-            sys.stdout = old_stdout
             return {
                 "success": False,
                 "error": str(e),
                 "traceback": traceback.format_exc(),
                 "output": redirected_output.getvalue()
             }
+
