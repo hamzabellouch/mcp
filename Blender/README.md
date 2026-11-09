@@ -30,7 +30,7 @@ It executes commands safely on Blender's main application thread via a non-block
 │                                     Blender Application                                    │
 │  ┌───────────────────────────────┐                  ┌───────────────────────────────────┐  │
 │  │   Blender MCP Bridge Addon    │ ─── Timer Queue ─>│    Blender Main Thread (bpy)      │  │
-│  │      (blender_addon.py)       │                  │ (Mesh, Materials, Render, Nodes)  │  │
+│  │      (Add-on/blender_addon.py)       │                  │ (Mesh, Materials, Render, Nodes)  │  │
 │  └───────────────────────────────┘                  └───────────────────────────────────┘  │
 └────────────────────────────────────────────────────────────────────────────────────────────┘
 ```

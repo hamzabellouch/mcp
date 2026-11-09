@@ -11,6 +11,9 @@ import asyncio
 import unittest
 import tempfile
 
+# Route bytecode cache to Tests/.cache
+sys.pycache_prefix = os.path.abspath(os.path.join(os.path.dirname(__file__), ".cache"))
+
 # Ensure FreeCAD project root is in sys.path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "FreeCAD"))
 if PROJECT_ROOT not in sys.path:
@@ -138,7 +141,14 @@ class TestFreeCADMCP(unittest.TestCase):
 
     def test_menu_commands_checkable(self):
         """Verify Addon menu toggle commands have Checkable=True."""
-        commands_file = os.path.join(PROJECT_ROOT, "addon", "FreeCADMCP", "rpc_server", "commands.py")
+        candidate_paths = [
+            os.path.join(PROJECT_ROOT, "add-on", "FreeCAD-mcp", "rpc_server", "gui.py"),
+            os.path.join(PROJECT_ROOT, "add-on", "FreeCAD-mcp", "rpc_server", "commands.py"),
+            os.path.join(PROJECT_ROOT, "add-on", "FreeCADMCP", "rpc_server", "commands.py"),
+            os.path.join(PROJECT_ROOT, "addon", "FreeCAD-mcp", "rpc_server", "commands.py"),
+            os.path.join(PROJECT_ROOT, "addon", "FreeCADMCP", "rpc_server", "commands.py"),
+        ]
+        commands_file = next((p for p in candidate_paths if os.path.exists(p)), candidate_paths[0])
         with open(commands_file, "r", encoding="utf-8") as f:
             content = f.read()
         self.assertIn('"Checkable": True', content)
@@ -251,12 +261,12 @@ print("CAD_PIPELINE_COMPLETE")
             def __init__(self, headers):
                 self.headers = headers
         
-        handler_with_origin = FakeHandler({"Origin": "https://malicious-site.com", "Host": "127.0.0.1:9877"})
+        handler_with_origin = FakeHandler({"Origin": "https://malicious-site.com", "Host": "127.0.0.1:2607"})
         rejection = FreeCADBridgeHTTPHandler._verify_request(handler_with_origin)
         self.assertIsNotNone(rejection)
         self.assertEqual(rejection[0], 403)
         
-        handler_with_bad_host = FakeHandler({"Host": "evil-domain.com:9877"})
+        handler_with_bad_host = FakeHandler({"Host": "evil-domain.com:2607"})
         rejection_host = FreeCADBridgeHTTPHandler._verify_request(handler_with_bad_host)
         self.assertIsNotNone(rejection_host)
         self.assertEqual(rejection_host[0], 403)

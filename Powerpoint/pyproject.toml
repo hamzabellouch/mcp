@@ -47,7 +47,7 @@ dependencies = [
 ]
 
 [project.scripts]
-powerpoint-mcp = "powerpoint_mcp_server:main"
+powerpoint-mcp = "powerpoint_mcp_servers:main"
 
 [tool.setuptools]
 py-modules = ["powerpoint_mcp_server", "powerpoint_engine"]

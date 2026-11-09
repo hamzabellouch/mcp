@@ -1,3 +1,319 @@
+"""
+FreeCAD MCP Add-on: Core XML-RPC Server & Security
+==================================================
+Consolidates protocol versioning, user settings persistence,
+IP allowlisting, browser request rejection (anti-CSRF/rebinding),
+and the XML-RPC server lifecycle & handler catalog.
+"""
+
+from __future__ import annotations
+
+import base64
+import contextlib
+import hmac
+import io
+import ipaddress
+import json
+import math
+import os
+import re
+import tempfile
+import threading
+import time
+import uuid
+from collections.abc import Callable
+from email.message import Message
+from socketserver import ThreadingMixIn
+from typing import Any
+from xmlrpc.client import Fault
+from xmlrpc.server import SimpleXMLRPCRequestHandler, SimpleXMLRPCServer
+
+import FreeCAD
+import FreeCADGui
+
+try:
+    from PySide import QtCore
+except ImportError:
+    try:
+        from PySide2 import QtCore
+    except ImportError:
+        from PySide6 import QtCore
+
+# ---------------------------------------------------------------------
+# 1. Version Information
+# ---------------------------------------------------------------------
+"""Addon version reported to the MCP server through get_rpc_status."""
+
+# Keep in step with the freecad-mcp package version in pyproject.toml.
+__version__ = "0.1.25"
+
+# Bump when the RPC contract changes in a way the MCP server must know about:
+# a method or parameter is added or removed, or a response shape changes.
+# Must match PROTOCOL_VERSION in src/freecad_mcp/version.py.
+PROTOCOL_VERSION = 1
+
+ADDON_VERSION = __version__
+
+# ---------------------------------------------------------------------
+# 2. Settings Persistence
+# ---------------------------------------------------------------------
+"""Persistence of MCP RPC server settings under FreeCAD's user app data dir."""
+
+import json
+import os
+
+import FreeCAD
+
+
+_SETTINGS_FILENAME = "freecad_mcp_settings.json"
+
+_DEFAULT_SETTINGS = {
+    "remote_enabled": False,
+    "allowed_ips": "127.0.0.1",
+    "auto_start_rpc": True,
+    "auth_token": "",  # empty = authentication disabled
+}
+
+
+def _get_settings_path():
+    return os.path.join(FreeCAD.getUserAppDataDir(), _SETTINGS_FILENAME)
+
+
+def load_settings():
+    path = _get_settings_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                settings = json.load(f)
+            for key, value in _DEFAULT_SETTINGS.items():
+                if key not in settings:
+                    settings[key] = value
+            return settings
+        except Exception as e:
+            FreeCAD.Console.PrintWarning(f"Failed to load MCP settings: {e}\n")
+    return dict(_DEFAULT_SETTINGS)
+
+
+def save_settings(settings):
+    path = _get_settings_path()
+    try:
+        with open(path, "w") as f:
+            json.dump(settings, f, indent=2)
+    except Exception as e:
+        FreeCAD.Console.PrintError(f"Failed to save MCP settings: {e}\n")
+
+
+# ---------------------------------------------------------------------
+# 3. Security, IP Filter & Anti-CSRF
+# ---------------------------------------------------------------------
+"""IP-filtered, optionally token-authenticated XML-RPC server and helpers.
+
+The server also refuses requests a web page could have sent. The IP allowlist
+cannot stop those: the browser runs on an allowed machine, so a malicious page
+could otherwise call execute_code (CSRF, or DNS rebinding to read the reply).
+"""
+
+import base64
+import hmac
+import ipaddress
+import re
+from email.message import Message
+from socketserver import ThreadingMixIn
+from xmlrpc.server import SimpleXMLRPCRequestHandler, SimpleXMLRPCServer
+
+import FreeCAD
+
+
+_XML_MEDIA_TYPES = frozenset({"text/xml", "application/xml"})
+
+
+def _host_name(host_header: str) -> str:
+    """Return the host of a Host header value, without port or brackets."""
+    host = host_header.strip().lower()
+    if host.startswith("["):  # IPv6 literal, e.g. [::1]:9875
+        return host[1:].split("]", 1)[0]
+    return host.rsplit(":", 1)[0].rstrip(".")
+
+
+def _is_loopback_name(name: str) -> bool:
+    if name == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+def browser_request_rejection(
+    headers: Message, loopback_only: bool
+) -> tuple[int, str] | None:
+    """Return ``(status, reason)`` for a request to refuse, or None to accept it.
+
+    Browsers attach Origin to every POST, and can send an XML body to another
+    origin only after a CORS preflight, which this server never answers.
+    xmlrpc.client sends text/xml without Origin, so MCP clients are unaffected.
+    The Host check stops DNS rebinding where it is decidable: a server bound to
+    loopback is only ever addressed as localhost.
+    """
+    if headers.get("Origin") is not None:
+        return 403, "requests from web pages are not accepted"
+    media_type = (headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+    if media_type not in _XML_MEDIA_TYPES:
+        return 415, "XML-RPC requests must use Content-Type text/xml"
+    host = headers.get("Host")
+    if loopback_only and host is not None and not _is_loopback_name(_host_name(host)):
+        return 403, "the local RPC server only accepts requests addressed to localhost"
+    return None
+
+
+class BrowserGuardRequestHandler(SimpleXMLRPCRequestHandler):
+    """Refuse requests a web page could have sent before they are dispatched."""
+
+    def do_POST(self) -> None:
+        rejection = browser_request_rejection(self.headers, self.server.loopback_only)
+        if rejection is None:
+            super().do_POST()
+            return
+        status, reason = rejection
+        FreeCAD.Console.PrintWarning(
+            f"MCP RPC: Rejected request from {self.client_address[0]}: {reason}\n"
+        )
+        body = reason.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")  # the unread body must not be parsed as a request
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def authorization_ok(header_value: str, token: str) -> bool:
+    """Check an ``Authorization`` header against the configured token.
+
+    Accepts ``Bearer <token>`` and HTTP Basic (token in the password field,
+    username ignored) so stdlib clients can use ``http://:token@host:port``
+    URIs. Comparisons are constant-time.
+    """
+    if header_value.startswith("Bearer "):
+        supplied = header_value[len("Bearer "):].strip()
+        return hmac.compare_digest(supplied, token)
+    if header_value.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(header_value[len("Basic "):], validate=True).decode("utf-8")
+        except Exception:
+            return False
+        _, _, password = decoded.partition(":")
+        return hmac.compare_digest(password, token)
+    return False
+
+
+class TokenAuthRequestHandler(BrowserGuardRequestHandler):
+    """Request handler that enforces the server's auth token when one is set."""
+
+    def parse_request(self):
+        if not super().parse_request():
+            return False
+        token = getattr(self.server, "auth_token", "")
+        if not token:
+            return True  # authentication disabled
+        if authorization_ok(self.headers.get("Authorization", ""), token):
+            return True
+        FreeCAD.Console.PrintWarning(
+            f"MCP RPC: Rejected unauthenticated request from {self.client_address[0]}\n"
+        )
+        self.send_error(401, "Unauthorized: valid auth token required")
+        return False
+
+
+class FilteredXMLRPCServer(ThreadingMixIn, SimpleXMLRPCServer):
+    """XML-RPC server that filters connections by allowed IP addresses/subnets
+    and, when a token is configured, requires an Authorization header.
+
+    Threaded so get_rpc_status stays answerable while a wedged GUI task blocks
+    another request. Document queries and synchronous modelling handlers
+    serialise onto the GUI thread through dispatch_to_gui. The opt-in
+    execute_code_async worker retains its existing background execution.
+
+    daemon_threads must stay true — ThreadingMixIn.server_close() joins
+    non-daemon request threads, which would make Stop wait out the stuck
+    operation.
+    """
+
+    daemon_threads = True
+
+    def __init__(self, addr, allowed_ips_str="127.0.0.1", auth_token="", **kwargs):
+        self._allowed_networks = _parse_allowed_ips(allowed_ips_str)
+        self.auth_token = auth_token or ""
+        # Remote clients address the server by its LAN name or IP, so only a
+        # loopback-bound server can require a localhost Host header.
+        self.loopback_only = _is_loopback_name(str(addr[0]).lower())
+        kwargs.setdefault("requestHandler", TokenAuthRequestHandler)
+        super().__init__(addr, **kwargs)
+
+    def verify_request(self, request, client_address):
+        client_ip = client_address[0]
+        try:
+            addr = ipaddress.ip_address(client_ip)
+            for network in self._allowed_networks:
+                if addr in network:
+                    return True
+        except ValueError:
+            pass
+        FreeCAD.Console.PrintWarning(
+            f"MCP RPC: Rejected connection from {client_ip}\n"
+        )
+        return False
+
+
+_COMMA_SEP_RE = re.compile(r"^\s*[^,\s]+(\s*,\s*[^,\s]+)*\s*$")
+
+
+def validate_allowed_ips(allowed_ips_str):
+    """Validate a comma-separated string of IP addresses/subnets.
+
+    Returns a ``(valid, errors)`` tuple.  ``valid`` is a list of normalised
+    entry strings that passed validation; ``errors`` is a list of
+    human-readable error messages (empty when the input is fully valid).
+
+    Checks performed:
+    1. The overall string is well-formed comma-separated (no leading/trailing
+       commas, no empty entries between commas, not blank).
+    2. Each individual entry is a valid IPv4/IPv6 address or CIDR subnet
+       (validated via the stdlib ``ipaddress`` module).
+    """
+    errors = []
+
+    if not allowed_ips_str or not allowed_ips_str.strip():
+        return [], ["Input must not be empty."]
+
+    if not _COMMA_SEP_RE.match(allowed_ips_str):
+        return [], [
+            "Malformed list — check for leading/trailing commas, "
+            "double commas, or missing separators."
+        ]
+
+    valid = []
+    for entry in allowed_ips_str.split(","):
+        entry = entry.strip()
+        try:
+            ipaddress.ip_network(entry, strict=False)
+            valid.append(entry)
+        except ValueError:
+            errors.append(f"Invalid IP/subnet: '{entry}'")
+    return valid, errors
+
+
+def _parse_allowed_ips(allowed_ips_str):
+    """Parse a comma-separated string of IPs/subnets into a list of ip_network objects."""
+    valid, errors = validate_allowed_ips(allowed_ips_str)
+    for msg in errors:
+        FreeCAD.Console.PrintWarning(f"MCP RPC: {msg}, skipping\n")
+    return [ipaddress.ip_network(entry, strict=False) for entry in valid]
+
+
+# ---------------------------------------------------------------------
+# 4. XML-RPC Server Implementation & Handler Registration
+# ---------------------------------------------------------------------
 import FreeCAD
 import FreeCADGui
 
@@ -22,9 +338,9 @@ except ImportError:
     except ImportError:
         from PySide6 import QtCore
 
-from rpc_server.commands import register_commands, schedule_toggle_sync
-from rpc_server.fem_executor import run_fem_analysis as _run_fem_analysis
-from rpc_server.gui_dispatch import (
+from .gui import register_commands, schedule_toggle_sync
+from .gui import run_fem_analysis as _run_fem_analysis
+from .gui import (
     cleanup_waker,
     dispatch_to_gui,
     get_dispatch_status,
@@ -32,14 +348,14 @@ from rpc_server.gui_dispatch import (
     process_gui_tasks,
     request_shutdown,
 )
-from rpc_server.ip_filter import FilteredXMLRPCServer, validate_allowed_ips
-from rpc_server.object_factory import create_object_gui, edit_object_gui
-from rpc_server.parts_library import get_parts_list, insert_part_from_library
-from rpc_server.property_mapper import Object
-from rpc_server.serialize import serialize_object
-from rpc_server.settings import load_settings, save_settings
-from rpc_server.version import PROTOCOL_VERSION, __version__ as ADDON_VERSION
-from rpc_server.view_manager import save_active_screenshot
+# (FilteredXMLRPCServer, validate_allowed_ips defined locally in server.py)
+from .geometry import create_object_gui, edit_object_gui
+from .geometry import get_parts_list, insert_part_from_library
+from .geometry import Object
+from .geometry import serialize_object
+# (load_settings, save_settings defined locally in server.py)
+# (PROTOCOL_VERSION, ADDON_VERSION defined locally in server.py)
+from .gui import save_active_screenshot
 
 rpc_server_thread = None
 rpc_server_instance = None
@@ -567,7 +883,7 @@ class FreeCADRPC:
         return save_active_screenshot(save_path, view_name, width, height, focus_object)
 
 
-def start_rpc_server(port: int = 9875) -> str:
+def start_rpc_server(port: int = 2607) -> str:
     global rpc_server_thread, rpc_server_instance
 
     if rpc_server_instance:

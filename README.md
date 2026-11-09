@@ -22,7 +22,7 @@ By combining interactive live desktop automation (via Windows COM and GUI RPC br
 | **[Word MCP](Word/)** | [`./Word`](Word/) | **22 Tools** | Live Windows COM + Headless `python-docx` + `lxml` | Document creation, typography, tables, TOC, watermarks, RTL/Arabic, comments, template filling, PDF export. |
 | **[PowerPoint MCP](Powerpoint/)** | [`./Powerpoint`](Powerpoint/) | **26 Tools** | Live Windows COM + Headless `python-pptx` | Presentation lifecycle, slide layout, KPI cards, charts, roadmaps/timelines, themes, regex replace, slide PNG/PDF export. |
 | **[Excel MCP](Excel/)** | [`./Excel`](Excel/) | **13 Tools** | Live Windows COM + Headless `openpyxl` | Workbook creation, range read/write, styling, formula execution, column/pie/line charts, statistical data profiling. |
-| **[FreeCAD MCP](FreeCAD/)** | [`./FreeCAD`](FreeCAD/) | **29 Tools** | Live Qt GUI RPC (`9875`) + Headless `FreeCADCmd` | 3D CAD modeling, boolean operations, sketch extrusion, TechDraw 2D sheets, CalculiX FEM structural simulations, mass analysis. |
+| **[FreeCAD MCP](FreeCAD/)** | [`./FreeCAD`](FreeCAD/) | **29 Tools** | Live Qt GUI RPC (`2607`) + Headless `FreeCADCmd` | 3D CAD modeling, boolean operations, sketch extrusion, TechDraw 2D sheets, CalculiX FEM structural simulations, mass analysis. |
 | **[Blender MCP](Blender/)** | [`./Blender`](Blender/) | **7 Tools** | FastMCP stdio + Blender Main-Thread Bridge (`9876`) | 3D primitives, PBR material creation, model importing (GLTF/OBJ/FBX), camera & lighting setup, Cycles/Eevee rendering. |
 
 ## 🚀 Quick Setup & Client Configuration
@@ -159,7 +159,7 @@ mcp/
 │   └── README.md            # FreeCAD server documentation
 │
 └── Blender/                 # Blender 3D MCP Server (7 tools)
-    ├── blender_addon.py     # Blender main-thread HTTP bridge addon
+    ├── Add-on/blender_addon.py     # Blender main-thread HTTP bridge addon
     ├── blender_mcp_server.py# FastMCP server definition
     ├── test_mcp.py          # Unit & mocked integration suite (20 tests)
     ├── pyproject.toml       # Package metadata

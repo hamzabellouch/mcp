@@ -24,6 +24,7 @@ eggs/
 .eggs/
 
 # --- Testing, Coverage & Logs ---
+.cache/
 .pytest_cache/
 .coverage
 htmlcov/

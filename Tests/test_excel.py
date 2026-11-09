@@ -14,6 +14,9 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
+# Route bytecode cache to Tests/.cache
+sys.pycache_prefix = os.path.abspath(os.path.join(os.path.dirname(__file__), ".cache"))
+
 # Ensure Excel project directory is in sys.path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Excel"))
 if PROJECT_ROOT not in sys.path:

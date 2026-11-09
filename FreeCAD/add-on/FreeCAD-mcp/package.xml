@@ -12,7 +12,7 @@
   <content>
     <workbench>
       <classname>FreeCADMCPAddonWorkbench</classname>
-      <name>MCP Addon</name>
+      <name>FreeCAD MCP</name>
       <!-- InitGui.py lives at the package root. Without an explicit
            subdirectory FreeCAD's package loader looks elsewhere and
            silently loads NOTHING — no workbench, no auto-start, while

@@ -41,14 +41,14 @@ FreeCAD MCP is built with thread-safe **Qt Queued Signals**, isolated subprocess
 ```
 
 ### Dual-Engine Execution Pipeline
-1. **Live GUI Mode (XML-RPC Port `9875` & HTTP Bridge Port `9877`)**: Communicates with an active FreeCAD GUI session. Commands are dispatched to the Qt main thread via queued signals (`QTimer` / custom event waker), ensuring responsive UI, instant 3D viewport rendering, and live PNG screenshot capture.
+1. **Live GUI Mode (XML-RPC Port `2607` & HTTP Bridge Port `2608`)**: Communicates with an active FreeCAD GUI session. Commands are dispatched to the Qt main thread via queued signals (`QTimer` / custom event waker), ensuring responsive UI, instant 3D viewport rendering, and live PNG screenshot capture.
 2. **Headless Execution (`FreeCADCmd`)**: Heavy OpenCASCADE boolean operations, mesh tessellations, or batch exports can run in isolated subprocesses. Any native C++ crashes (segfaults) are safely trapped without risking unsaved GUI work.
 
 ## ⭐ Key Features & Capabilities
 
 | Feature | API / Method | Performance | Safety / Isolation | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| **Live GUI Interaction** | XML-RPC (`Port 9875`) & Qt Queued Signals | **Real-Time** (< 50ms) | **Thread-Safe** | Executes code directly on FreeCAD's main GUI thread without UI freezing or race conditions. |
+| **Live GUI Interaction** | XML-RPC (`Port 2607`) & Qt Queued Signals | **Real-Time** (< 50ms) | **Thread-Safe** | Executes code directly on FreeCAD's main GUI thread without UI freezing or race conditions. |
 | **Headless Isolated Execution** | `FreeCADCmd` Subprocess Runner | **High-Speed** | **Crash-Isolated** | Runs heavy OCCT scripts in separate processes; native C++ crashes never affect open GUI documents. |
 | **Asynchronous Computation** | Background Threading & `commit()` Helper | **Non-Blocking** | **Scenegraph Protected** | Performs heavy OCCT booleans/lofts in the background while safely updating documents via GUI commits. |
 | **Live 3D Viewport Screenshots** | Offscreen Render & Coin3D Camera Views | **Instant** (< 200ms) | **Base64 Encoded** | Returns visual PNG images after each operation from Isometric, Front, Top, Right, or Custom angles. |
@@ -80,7 +80,7 @@ Installing the Addon provides a dedicated **MCP Workbench**, GUI menu bar, and s
    - **Linux**: `~/.local/share/FreeCAD/Mod/`
    - **macOS**: `~/Library/Application Support/FreeCAD/Mod/`
 
-2. Copy the `addon/FreeCADMCP` folder into the `Mod` directory:
+2. Copy the `add-on/FreeCAD-mcp` folder into the `Mod` directory:
    - **PowerShell (Windows)**:
      ```powershell
      Copy-Item -Path ".\addon\FreeCADMCP" -Destination "$env:APPDATA\FreeCAD\Mod\FreeCADMCP" -Recurse -Force
@@ -88,7 +88,7 @@ Installing the Addon provides a dedicated **MCP Workbench**, GUI menu bar, and s
    - **Bash (Linux/macOS)**:
      ```bash
      mkdir -p ~/.local/share/FreeCAD/Mod/
-     cp -r addon/FreeCADMCP ~/.local/share/FreeCAD/Mod/
+     cp -r add-on/FreeCAD-mcp ~/.local/share/FreeCAD/Mod/
      ```
 
 3. Launch FreeCAD. The **FreeCAD MCP** menu will appear in the top menu bar. Click **Start RPC Server** (or enable Auto-Start).
@@ -99,7 +99,7 @@ If you prefer not to install an Addon, you can run the bridge as a macro directl
 1. Open FreeCAD.
 2. Go to **Macro** -> **Macros...**.
 3. Select or browse to `freecad_macro_bridge.py`.
-4. Click **Execute**. The XML-RPC server (Port `9875`) and HTTP bridge (Port `9877`) will start immediately.
+4. Click **Execute**. The XML-RPC server (Port `2607`) and HTTP bridge (Port `2608`) will start immediately.
 
 #### Method C: Headless & Environment Variables Setup 🖥️
 For automated CI/CD pipelines or headless server environments without a GUI:

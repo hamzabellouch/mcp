@@ -59,7 +59,10 @@ def run_suite(key: str, info: dict) -> bool:
     print("=" * 65 + "\n")
 
     start_time = time.time()
-    result = subprocess.run([sys.executable, test_file])
+    cache_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".cache"))
+    env = os.environ.copy()
+    env["PYTHONPYCACHEPREFIX"] = cache_dir
+    result = subprocess.run([sys.executable, test_file], env=env)
     duration = time.time() - start_time
 
     success = result.returncode == 0

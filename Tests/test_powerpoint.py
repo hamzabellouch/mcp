@@ -15,13 +15,16 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
+# Route bytecode cache to Tests/.cache
+sys.pycache_prefix = os.path.abspath(os.path.join(os.path.dirname(__file__), ".cache"))
+
 # Ensure Powerpoint project directory is in sys.path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Powerpoint"))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-import powerpoint_mcp_server as srv
-from powerpoint_engine import COM_AVAILABLE
+import powerpoint_mcp_servers as srv
+from powerpoint_mcp_servers import COM_AVAILABLE
 
 TEST_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "temp_enterprise_pitch.pptx"))
 TEST_SAVED_AS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "temp_saved_as.pptx"))

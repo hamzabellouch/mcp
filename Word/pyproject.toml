@@ -49,10 +49,10 @@ dependencies = [
 dev = ["pytest>=7.0"]
 
 [project.scripts]
-word-mcp = "word_mcp_server:main"
+word-mcp = "word_mcp_servers:main"
 
 [tool.setuptools]
-py-modules = ["word_mcp_server", "word_engine", "com_runtime"]
+py-modules = ["word_mcp_servers"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

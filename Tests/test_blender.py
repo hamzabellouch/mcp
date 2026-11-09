@@ -11,6 +11,9 @@ import tempfile
 import json
 from unittest.mock import patch, MagicMock
 
+# Route bytecode cache to Tests/.cache
+sys.pycache_prefix = os.path.abspath(os.path.join(os.path.dirname(__file__), ".cache"))
+
 # Ensure Blender project directory is in sys.path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Blender"))
 if PROJECT_ROOT not in sys.path:

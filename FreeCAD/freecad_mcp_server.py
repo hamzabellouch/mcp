@@ -79,7 +79,7 @@ class FreeCADConnection:
     def __init__(
         self,
         host: str = "localhost",
-        port: int = 9875,
+        port: int = 2607,
         timeout: float = 150,
         token: Optional[str] = None,
     ):
@@ -394,8 +394,8 @@ def run_headless(code: str, timeout: float = 600.0, command: Optional[List[str]]
 class FreeCADEngine:
     """Unified FreeCAD engine coordinating RPC, HTTP bridge, and headless execution."""
     
-    RPC_PORT = int(os.environ.get("FREECAD_RPC_PORT", "9875"))
-    HTTP_PORT = int(os.environ.get("FREECAD_BRIDGE_PORT", "9877"))
+    RPC_PORT = int(os.environ.get("FREECAD_RPC_PORT", "2607"))
+    HTTP_PORT = int(os.environ.get("FREECAD_BRIDGE_PORT", "2608"))
     DEFAULT_HOST = os.environ.get("FREECAD_HOST", "127.0.0.1")
     DEFAULT_TOKEN = os.environ.get("FREECAD_MCP_TOKEN", None)
     
@@ -433,7 +433,7 @@ class FreeCADEngine:
 
     @classmethod
     def check_rpc_connection(cls, timeout: float = 2.0) -> Dict[str, Any]:
-        """Check if FreeCAD XML-RPC Server (Port 9875) is active."""
+        """Check if FreeCAD XML-RPC Server (Port 2607) is active."""
         try:
             conn = cls.get_rpc_connection()
             status = conn.get_rpc_status()
@@ -446,7 +446,7 @@ class FreeCADEngine:
 
     @classmethod
     def check_http_bridge(cls, timeout: float = 1.5) -> Dict[str, Any]:
-        """Check if FreeCAD HTTP Bridge (Port 9877) is active."""
+        """Check if FreeCAD HTTP Bridge (Port 2607) is active."""
         url = f"http://{cls.DEFAULT_HOST}:{cls.HTTP_PORT}/status"
         try:
             res = requests.get(url, headers=cls._http_headers(), timeout=timeout)
@@ -478,8 +478,8 @@ class FreeCADEngine:
     def execute_code(cls, script_code: str, timeout: float = 90.0) -> Dict[str, Any]:
         """
         Executes a Python script using the best available execution method:
-        1. Live GUI via XML-RPC (port 9875)
-        2. Live GUI via HTTP Bridge (port 9877)
+        1. Live GUI via XML-RPC (port 2607)
+        2. Live GUI via HTTP Bridge (port 2608)
         3. Headless FreeCADCmd subprocess
         """
         # 1. Try Live XML-RPC
@@ -605,7 +605,7 @@ ToolResponse = List[Union[TextContent, ImageContent]]
 class ServerState:
     only_text_feedback: bool = True
     rpc_host: str = os.environ.get("FREECAD_HOST", "localhost")
-    rpc_port: int = int(os.environ.get("FREECAD_RPC_PORT", "9875"))
+    rpc_port: int = int(os.environ.get("FREECAD_RPC_PORT", "2607"))
     auth_token: Optional[str] = os.environ.get("FREECAD_MCP_TOKEN", None)
     freecad_connection: Optional[FreeCADConnection] = None
     freecadcmd: Optional[List[str]] = None
@@ -2383,7 +2383,7 @@ def main():
     parser = argparse.ArgumentParser(description="FreeCAD MCP Server")
     parser.add_argument("--only-text-feedback", action="store_true", help="Only return text feedback (suppress inline screenshots)")
     parser.add_argument("--host", default=os.environ.get("FREECAD_HOST", "localhost"), help="FreeCAD RPC Host (default: localhost)")
-    parser.add_argument("--port", type=int, default=int(os.environ.get("FREECAD_RPC_PORT", "9875")), help="FreeCAD RPC Port (default: 9875)")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("FREECAD_RPC_PORT", "2607")), help="FreeCAD RPC Port (default: 2607)")
     parser.add_argument("--auth-token", default=os.environ.get("FREECAD_MCP_TOKEN", None), help="FreeCAD RPC Auth Token")
     parser.add_argument("--freecadcmd", default=None, help="Path or command for headless FreeCADCmd")
     parser.add_argument("--test", action="store_true", help="Run unit & integration test suite")

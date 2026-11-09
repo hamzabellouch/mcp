@@ -14,6 +14,9 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
+# Route bytecode cache to Tests/.cache
+sys.pycache_prefix = os.path.abspath(os.path.join(os.path.dirname(__file__), ".cache"))
+
 # Ensure Word project directory is in sys.path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Word"))
 if PROJECT_ROOT not in sys.path:
@@ -22,7 +25,7 @@ if PROJECT_ROOT not in sys.path:
 # The script tool is only registered when explicitly enabled; enable it for this run.
 os.environ.setdefault("WORD_MCP_ENABLE_SCRIPT", "1")
 
-import word_mcp_server as srv
+import word_mcp_servers as srv
 
 # Record every tool that answers with an error so the final banner is honest.
 FAILURES = []
