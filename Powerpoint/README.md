@@ -158,7 +158,7 @@ pip install -e .
     "powerpoint": {
       "command": "python",
       "args": [
-        "/path/to/powerpoint-mcp-server/powerpoint_mcp_server.py"
+        "/path/to/powerpoint-mcp-server/powerpoint_mcp_servers.py"
       ],
       "env": {
         "PYTHONIOENCODING": "utf-8"
@@ -176,7 +176,7 @@ pip install -e .
     "powerpoint": {
       "command": "python",
       "args": [
-        "/path/to/powerpoint-mcp-server/powerpoint_mcp_server.py"
+        "/path/to/powerpoint-mcp-server/powerpoint_mcp_servers.py"
       ],
       "env": {
         "PYTHONIOENCODING": "utf-8"
@@ -194,7 +194,7 @@ pip install -e .
     "powerpoint": {
       "command": "python",
       "args": [
-        "/path/to/powerpoint-mcp-server/powerpoint_mcp_server.py"
+        "/path/to/powerpoint-mcp-server/powerpoint_mcp_servers.py"
       ],
       "env": {
         "PYTHONIOENCODING": "utf-8"
@@ -206,10 +206,10 @@ pip install -e .
 
 ## 🧪 Testing & Verification
 
-Run the comprehensive test suite verifying all 26 tools:
+Run the comprehensive test suite from the repository root verifying all 26 tools:
 
 ```bash
-python test_mcp.py
+python Tests/run_all.py powerpoint
 ```
 
 Expected output:

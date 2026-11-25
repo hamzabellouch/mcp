@@ -446,7 +446,7 @@ class FreeCADEngine:
 
     @classmethod
     def check_http_bridge(cls, timeout: float = 1.5) -> Dict[str, Any]:
-        """Check if FreeCAD HTTP Bridge (Port 2607) is active."""
+        """Check if FreeCAD HTTP Bridge (Port 2608) is active."""
         url = f"http://{cls.DEFAULT_HOST}:{cls.HTTP_PORT}/status"
         try:
             res = requests.get(url, headers=cls._http_headers(), timeout=timeout)
@@ -513,6 +513,11 @@ class FreeCADEngine:
                     data = r.json()
                     data["mode"] = "http_bridge"
                     return data
+                return {
+                    "success": False,
+                    "mode": "http_bridge",
+                    "error": f"HTTP bridge returned status {r.status_code}: {r.text}",
+                }
             except Exception as e:
                 logger.warning(f"HTTP bridge request error: {e}")
 
@@ -568,8 +573,11 @@ class FreeCADBridgeHTTPHandler(BaseHTTPRequestHandler):
             return 403, "Requests from web browsers/origins are not accepted"
 
         # 2. DNS rebinding check
-        host = handler_instance.headers.get("Host", "")
-        host_clean = host.split(":")[0].strip().lower()
+        host = handler_instance.headers.get("Host", "").strip().lower()
+        if host.startswith("["):
+            host_clean = host[1:].split("]", 1)[0]
+        else:
+            host_clean = host.rsplit(":", 1)[0].rstrip(".")
         if host_clean not in ("127.0.0.1", "localhost", "::1"):
             return 403, "Requests must be addressed to localhost or 127.0.0.1"
 
@@ -716,7 +724,9 @@ def create_document(name: str = "Unnamed") -> ToolResponse:
         return text_response(f"Failed to create document: {res.get('error', 'Unknown error')}")
     except Exception:
         # Fallback to engine
-        engine_res = FreeCADEngine.execute_code(f"import FreeCAD\ndoc = FreeCAD.newDocument('{name}')\nFreeCAD.setActiveDocument(doc.Name)")
+        engine_res = FreeCADEngine.execute_code(
+            f"import FreeCAD\ndoc = FreeCAD.newDocument({json.dumps(name)})\nFreeCAD.setActiveDocument(doc.Name)"
+        )
         if engine_res.get("success"):
             return text_response(f"Document '{name}' created successfully.")
         return text_response(f"Error creating document: {engine_res.get('error')}")
@@ -733,6 +743,8 @@ def list_documents() -> ToolResponse:
         return json_response(docs)
     except Exception:
         engine_res = FreeCADEngine.execute_code("import FreeCAD, json\nprint('__JSON__:' + json.dumps(list(FreeCAD.listDocuments().keys())))")
+        if not engine_res.get("success"):
+            return text_response(f"Error listing documents: {engine_res.get('error', 'No FreeCAD runtime available')}")
         stdout = engine_res.get("stdout", "")
         if "__JSON__:" in stdout:
             return text_response(stdout.split("__JSON__:")[1].strip())
@@ -1228,10 +1240,17 @@ pos = payload["position"]
 rot = payload["rotation_axis_angle"]
 doc_name = payload["document_name"]
 
-doc = FreeCAD.getDocument(doc_name) if doc_name else FreeCAD.ActiveDocument
-if not doc:
-    doc = FreeCAD.newDocument("CAD_Model")
-    FreeCAD.setActiveDocument(doc.Name)
+if doc_name:
+    try:
+        doc = FreeCAD.getDocument(doc_name)
+    except Exception:
+        doc = FreeCAD.newDocument(doc_name)
+        FreeCAD.setActiveDocument(doc.Name)
+else:
+    doc = FreeCAD.ActiveDocument
+    if not doc:
+        doc = FreeCAD.newDocument("CAD_Model")
+        FreeCAD.setActiveDocument(doc.Name)
 
 if p_type == "box":
     obj = doc.addObject("Part::Box", obj_name or "Box")
@@ -1268,12 +1287,24 @@ elif p_type == "tube":
         obj.OuterRadius = float(dims.get('outer_radius', 10.0))
         obj.Height = float(dims.get('height', 20.0))
     except Exception:
-        obj = doc.addObject("Part::Tube", obj_name or "Tube")
-        if hasattr(obj, "InnerRadius"):
-            obj.InnerRadius = float(dims.get('inner_radius', 7.0))
-            obj.OuterRadius = float(dims.get('outer_radius', 10.0))
-            obj.Height = float(dims.get('height', 20.0))
-        else:
+        created_part_tube = None
+        try:
+            created_part_tube = doc.addObject("Part::Tube", obj_name or "Tube")
+            if hasattr(created_part_tube, "InnerRadius"):
+                created_part_tube.InnerRadius = float(dims.get('inner_radius', 7.0))
+                created_part_tube.OuterRadius = float(dims.get('outer_radius', 10.0))
+                created_part_tube.Height = float(dims.get('height', 20.0))
+                obj = created_part_tube
+            else:
+                doc.removeObject(created_part_tube.Name)
+                created_part_tube = None
+                raise RuntimeError("Part::Tube lacks InnerRadius")
+        except Exception:
+            if created_part_tube is not None:
+                try:
+                    doc.removeObject(created_part_tube.Name)
+                except Exception:
+                    pass
             outer = Part.makeCylinder(float(dims.get('outer_radius', 10.0)), float(dims.get('height', 20.0)))
             inner = Part.makeCylinder(float(dims.get('inner_radius', 7.0)), float(dims.get('height', 20.0)))
             obj = doc.addObject("Part::Feature", obj_name or "Tube")
@@ -1505,10 +1536,17 @@ def freecad_create_sketch_and_extrude(
 import FreeCAD, Sketcher, Part, json
 payload = json.loads({json.dumps(payload_json)})
 doc_name = payload["document_name"]
-doc = FreeCAD.getDocument(doc_name) if doc_name else FreeCAD.ActiveDocument
-if not doc:
-    doc = FreeCAD.newDocument("CAD_Model")
-    FreeCAD.setActiveDocument(doc.Name)
+if doc_name:
+    try:
+        doc = FreeCAD.getDocument(doc_name)
+    except Exception:
+        doc = FreeCAD.newDocument(doc_name)
+        FreeCAD.setActiveDocument(doc.Name)
+else:
+    doc = FreeCAD.ActiveDocument
+    if not doc:
+        doc = FreeCAD.newDocument("CAD_Model")
+        FreeCAD.setActiveDocument(doc.Name)
 
 body = doc.addObject("PartDesign::Body", payload["body_name"] or "Body")
 sketch = body.newObject("Sketcher::SketchObject", payload["sketch_name"] or "Sketch")
@@ -1687,9 +1725,10 @@ res_dir = FreeCAD.getResourceDir()
 cand_path = os.path.join(res_dir, "Mod", "TechDraw", "Templates", template_file)
 if not os.path.exists(cand_path):
     cand_path = os.path.join(res_dir, "Mod", "TechDraw", "Templates", "Default_Template_A4_Landscape.svg")
-if not os.path.exists(cand_path) and hasattr(TechDraw, "findTemplate"):
+if hasattr(TechDraw, "findTemplate") and (not cand_path or not os.path.exists(cand_path)):
     cand_path = TechDraw.findTemplate(template_file)
-template.Template = cand_path
+if cand_path and os.path.exists(cand_path):
+    template.Template = cand_path
 page.Template = template
 doc.recompute()
 
@@ -1718,6 +1757,12 @@ for v in views:
         dv.Direction = FreeCAD.Vector(0, 0, 1)
     elif v == "Right":
         dv.Direction = FreeCAD.Vector(1, 0, 0)
+    elif v == "Left":
+        dv.Direction = FreeCAD.Vector(-1, 0, 0)
+    elif v == "Bottom":
+        dv.Direction = FreeCAD.Vector(0, 0, -1)
+    elif v == "Rear":
+        dv.Direction = FreeCAD.Vector(0, 1, 0)
     elif v == "Isometric":
         dv.Direction = FreeCAD.Vector(1, -1, 1)
     page.addView(dv)
@@ -1729,14 +1774,17 @@ exp_path = payload.get("export_filepath")
 if exp_path:
     norm_exp = exp_path.replace("\\\\", "/")
     os.makedirs(os.path.dirname(norm_exp) or ".", exist_ok=True)
-    if norm_exp.lower().endswith(".pdf"):
-        import TechDrawGui
-        TechDrawGui.exportPageAsPdf(page, norm_exp)
-    elif norm_exp.lower().endswith(".dxf"):
+    if norm_exp.lower().endswith(".dxf"):
         TechDraw.writeDXFPage(page, norm_exp)
     else:
-        import TechDrawGui
-        TechDrawGui.exportPageAsSvg(page, norm_exp)
+        try:
+            import TechDrawGui
+        except ImportError as exc:
+            raise RuntimeError("TechDraw SVG/PDF export requires FreeCAD GUI mode (TechDrawGui unavailable in headless mode). Use .dxf or run via live FreeCAD GUI.") from exc
+        if norm_exp.lower().endswith(".pdf"):
+            TechDrawGui.exportPageAsPdf(page, norm_exp)
+        else:
+            TechDrawGui.exportPageAsSvg(page, norm_exp)
     print(f"TechDraw exported to: {{norm_exp}}")
 """
     res = FreeCADEngine.execute_code(code)
@@ -1876,8 +1924,24 @@ elif fmt == "stl":
             except Exception:
                 pass
 elif fmt == "obj":
-    import ImportGui
-    ImportGui.export(export_list, dest)
+    try:
+        import ImportGui
+        ImportGui.export(export_list, dest)
+    except ImportError:
+        import Mesh
+        mesh_objs = []
+        try:
+            for o in export_list:
+                m = doc.addObject("Mesh::Feature", f"__temp_mesh_{{o.Name}}")
+                m.Mesh = Mesh.Mesh(o.Shape.tessellate(0.5))
+                mesh_objs.append(m)
+            Mesh.export(mesh_objs, dest)
+        finally:
+            for m in mesh_objs:
+                try:
+                    doc.removeObject(m.Name)
+                except Exception:
+                    pass
 elif fmt in ["iges", "igs"]:
     import Import
     Import.export(export_list, dest)
@@ -2093,6 +2157,8 @@ def freecad_apply_color_matrix(
     }
     code = f"""
 import FreeCAD, FreeCADGui, json
+if not getattr(FreeCAD, "GuiUp", False):
+    raise RuntimeError("Color matrix requires the FreeCAD GUI viewport (FreeCAD.GuiUp is False).")
 payload = json.loads({json.dumps(json.dumps(payload))})
 doc_name = payload["document_name"]
 doc = FreeCAD.getDocument(doc_name) if doc_name else FreeCAD.ActiveDocument
@@ -2178,6 +2244,8 @@ def freecad_animate_mechanism(
         duration_seconds: Animation runtime in seconds before automatically stopping (default 5.0).
         document_name: Optional document name.
     """
+    if int(fps) <= 0 or float(duration_seconds) <= 0:
+        return text_response("❌ Animation 'fps' and 'duration_seconds' must be positive numbers.")
     payload = {
         "object_name": object_name,
         "axis": axis or [0.0, 0.0, 1.0],
@@ -2188,6 +2256,8 @@ def freecad_animate_mechanism(
     }
     code = f"""
 import FreeCAD, FreeCADGui, json, time
+if not getattr(FreeCAD, "GuiUp", False):
+    raise RuntimeError("Mechanism animation requires the FreeCAD GUI viewport (FreeCAD.GuiUp is False).")
 try:
     from PySide import QtCore
 except ImportError:
@@ -2312,9 +2382,14 @@ fcstd_path = os.path.join(model_dir, f"{{base_name}}.FCStd").replace("\\\\", "/"
 Import.export([target], step_path)
 
 temp_mesh = doc.addObject("Mesh::Feature", f"__bundle_mesh_{{target.Name}}")
-temp_mesh.Mesh = Mesh.Mesh(target.Shape.tessellate(0.2))
-Mesh.export([temp_mesh], stl_path)
-doc.removeObject(temp_mesh.Name)
+try:
+    temp_mesh.Mesh = Mesh.Mesh(target.Shape.tessellate(0.2))
+    Mesh.export([temp_mesh], stl_path)
+finally:
+    try:
+        doc.removeObject(temp_mesh.Name)
+    except Exception:
+        pass
 
 doc.saveAs(fcstd_path)
 
@@ -2392,7 +2467,12 @@ def main():
     if args.test:
         import unittest
         loader = unittest.defaultTestLoader
-        suite = loader.discover(os.path.dirname(os.path.abspath(__file__)), pattern="test_*.py")
+        server_dir = os.path.dirname(os.path.abspath(__file__))
+        suite = loader.discover(server_dir, pattern="test_*.py")
+        if suite.countTestCases() == 0:
+            central_tests = os.path.join(os.path.dirname(server_dir), "Tests")
+            if os.path.isdir(central_tests):
+                suite = loader.discover(central_tests, pattern="test_freecad*.py")
         runner = unittest.TextTestRunner(verbosity=2)
         result = runner.run(suite)
         sys.exit(0 if result.wasSuccessful() else 1)

@@ -46,7 +46,7 @@ TEST_SUITES = {
     "word": {
         "name": "Word MCP",
         "file": "test_word.py",
-        "description": "All 22 tools, styles, headings, tables, callouts, TOC, comments, COM/docx engine",
+        "description": "All 24 tools, styles, headings, rich inline, merges, modify/clear, COM/docx engine",
     },
 }
 

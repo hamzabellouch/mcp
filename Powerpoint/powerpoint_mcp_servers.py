@@ -30,6 +30,8 @@ import io
 import sys
 import json
 import re
+import time
+import subprocess
 import traceback
 import tempfile
 import urllib.request
@@ -86,11 +88,9 @@ def hex_to_bgr_int(hex_str: str) -> int:
 
 
 def clean_hex(hex_str: str) -> str:
-    """Return 6-character hex string without leading '#'."""
-    hex_str = str(hex_str).strip().lstrip('#')
-    if len(hex_str) == 3:
-        hex_str = ''.join([c * 2 for c in hex_str])
-    return hex_str.upper()
+    """Return 6-character uppercase hex string without leading '#'."""
+    r, g, b = parse_hex_color(hex_str)
+    return f"{r:02X}{g:02X}{b:02X}"
 
 
 def is_arabic_text(text: str) -> bool:
@@ -99,18 +99,23 @@ def is_arabic_text(text: str) -> bool:
 
 
 def cleanup_stale_lock_files(target_path: Optional[str] = None):
-    """Remove orphaned Microsoft PowerPoint ~$*.pptx hidden lock files when PowerPoint is not actively running."""
+    """Remove orphaned Microsoft PowerPoint ~$*.pptx hidden lock files only when no POWERPNT.EXE is running."""
     try:
-        # Never touch lock files if PowerPoint is currently running to prevent corruption
-        if COM_AVAILABLE and LivePowerPointSession.is_running():
+        if LivePowerPointSession._process_exists() or (COM_AVAILABLE and LivePowerPointSession.is_running()):
             return
         if target_path:
-            dir_path = os.path.dirname(os.path.abspath(target_path)) if (os.path.isfile(target_path) or '.' in os.path.basename(target_path)) else os.path.abspath(target_path)
+            abs_target = os.path.abspath(target_path)
+            if os.path.isdir(abs_target):
+                dir_path = abs_target
+            elif abs_target.lower().endswith((".pptx", ".ppt", ".potx", ".ppsx")):
+                dir_path = os.path.dirname(abs_target)
+            else:
+                dir_path = abs_target if not os.path.splitext(abs_target)[1] else os.path.dirname(abs_target)
         else:
             dir_path = os.getcwd()
         if os.path.exists(dir_path):
             for fname in os.listdir(dir_path):
-                if fname.startswith("~$") and fname.endswith(".pptx"):
+                if fname.startswith("~$") and fname.lower().endswith(".pptx"):
                     lock_file = os.path.join(dir_path, fname)
                     try:
                         if sys.platform == "win32":
@@ -323,6 +328,31 @@ class LivePowerPointSession:
     """Manages interactive connection to Microsoft PowerPoint desktop application via pywin32 COM."""
 
     @staticmethod
+    def _process_exists() -> bool:
+        if sys.platform != "win32":
+            return False
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq POWERPNT.EXE", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            ).stdout
+            return "powerpnt.exe" in out.lower()
+        except Exception:
+            return False
+
+    @staticmethod
+    def _same_path(p1: str, p2: str) -> bool:
+        if "://" in p1 or "://" in p2:
+            return p1.lower() == p2.lower()
+        try:
+            return os.path.normcase(os.path.abspath(p1)) == os.path.normcase(os.path.abspath(p2))
+        except Exception:
+            return p1.lower() == p2.lower()
+
+    @staticmethod
     def get_app(create_if_missing: bool = False, visible: bool = True):
         if not COM_AVAILABLE:
             raise RuntimeError("pywin32 (win32com) is not installed in this Python environment.")
@@ -370,14 +400,12 @@ class LivePowerPointSession:
             app = LivePowerPointSession.get_app(create_if_missing=False)
         if not app:
             return None
-        target = os.path.abspath(filepath).lower()
         try:
             for i in range(1, app.Presentations.Count + 1):
                 p = app.Presentations(i)
                 try:
-                    if p.FullName and os.path.abspath(p.FullName).lower() == target:
-                        return p
-                    if os.path.basename(target) == p.Name.lower():
+                    full_name = getattr(p, "FullName", "") or ""
+                    if full_name and LivePowerPointSession._same_path(full_name, filepath):
                         return p
                 except Exception:
                     pass
@@ -387,8 +415,7 @@ class LivePowerPointSession:
 
 
 def save_pptx_safely(prs: pptx.Presentation, target_path: str):
-    """Save python-pptx Presentation safely, closing and reopening in COM if open in live PowerPoint."""
-    import time
+    """Save python-pptx Presentation safely without discarding unsaved PowerPoint edits."""
     abs_path = os.path.abspath(target_path)
     os.makedirs(os.path.dirname(abs_path), exist_ok=True)
     com_prs_was_open = False
@@ -400,17 +427,31 @@ def save_pptx_safely(prs: pptx.Presentation, target_path: str):
             if app:
                 prs_com = LivePowerPointSession.find_presentation_by_path(abs_path, app)
                 if prs_com:
+                    if not getattr(prs_com, "Saved", True):
+                        raise RuntimeError(
+                            f"Presentation '{abs_path}' has unsaved changes open in PowerPoint. Save or close it first."
+                        )
                     com_prs_was_open = True
-                    try:
-                        prs_com.Saved = True
-                        prs_com.Close()
-                    except Exception:
-                        pass
+                    prs_com.Close()
+        except RuntimeError:
+            raise
         except Exception:
             pass
 
-    time.sleep(0.05)
-    prs.save(abs_path)
+    if com_prs_was_open:
+        time.sleep(0.15)
+
+    last_err = None
+    for attempt in range(4):
+        try:
+            prs.save(abs_path)
+            last_err = None
+            break
+        except PermissionError as exc:
+            last_err = exc
+            time.sleep(0.15 * (attempt + 1))
+    if last_err is not None:
+        raise last_err
 
     if com_prs_was_open and app:
         try:
@@ -425,6 +466,65 @@ def save_pptx_safely(prs: pptx.Presentation, target_path: str):
 
 class PowerPointEngine:
     """Enterprise-grade dual-mode engine for Microsoft PowerPoint automation."""
+
+    @staticmethod
+    def _resolve_target_path(filepath: Optional[str] = None) -> str:
+        """Resolve an existing .pptx path cleanly; never hijack an open deck when explicit filepath is missing."""
+        if filepath:
+            abs_fp = os.path.abspath(filepath)
+            if not os.path.exists(abs_fp):
+                raise FileNotFoundError(f"Presentation file not found: {filepath}")
+            return abs_fp
+
+        target_path = None
+        if COM_AVAILABLE:
+            app = LivePowerPointSession.get_app(create_if_missing=False)
+            if app:
+                prs_com = LivePowerPointSession.get_active_presentation(app)
+                if prs_com:
+                    try:
+                        target_path = prs_com.FullName
+                    except Exception:
+                        pass
+
+        if not target_path or not os.path.exists(target_path):
+            raise FileNotFoundError(f"Presentation file not found: {filepath or 'No active presentation'}")
+        return os.path.abspath(target_path)
+
+    @staticmethod
+    def _set_paragraph_text_preserving_style(paragraph, new_text: str) -> None:
+        """Update paragraph text while preserving the first run's explicit font styling when present."""
+        first_run = paragraph.runs[0] if paragraph.runs else None
+        font_snapshot = None
+        if first_run is not None:
+            try:
+                rgb = first_run.font.color.rgb if first_run.font.color and first_run.font.color.type == 1 else None
+            except Exception:
+                rgb = None
+            font_snapshot = (
+                first_run.font.name,
+                first_run.font.size,
+                first_run.font.bold,
+                first_run.font.italic,
+                first_run.font.underline,
+                rgb,
+            )
+        paragraph.text = new_text
+        if font_snapshot and paragraph.runs:
+            name, size, bold, italic, underline, rgb = font_snapshot
+            run = paragraph.runs[0]
+            if name:
+                run.font.name = name
+            if size:
+                run.font.size = size
+            if bold is not None:
+                run.font.bold = bold
+            if italic is not None:
+                run.font.italic = italic
+            if underline is not None:
+                run.font.underline = underline
+            if rgb is not None:
+                run.font.color.rgb = rgb
 
     @classmethod
     def get_status(cls) -> Dict[str, Any]:
@@ -487,7 +587,7 @@ class PowerPointEngine:
     ) -> Dict[str, Any]:
         """Create a new presentation with 16:9 or 4:3 aspect ratio and optional title slide."""
         cleanup_stale_lock_files(filepath)
-        palette = THEME_PALETTES.get(theme, THEME_PALETTES["modern_blue"])
+        palette = THEME_PALETTES.get(theme.lower(), THEME_PALETTES["modern_blue"])
 
         # Create using python-pptx
         prs = pptx.Presentation()
@@ -540,7 +640,7 @@ class PowerPointEngine:
 
         out_path = os.path.abspath(filepath) if filepath else os.path.abspath("Presentation.pptx")
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        prs.save(out_path)
+        save_pptx_safely(prs, out_path)
 
         # If COM is running or visible requested, open in live PowerPoint
         live_opened = False
@@ -548,7 +648,9 @@ class PowerPointEngine:
             try:
                 app = LivePowerPointSession.get_app(create_if_missing=True, visible=True)
                 if app:
-                    app.Presentations.Open(out_path)
+                    existing = LivePowerPointSession.find_presentation_by_path(out_path, app)
+                    if not existing:
+                        app.Presentations.Open(out_path)
                     live_opened = True
             except Exception:
                 pass
@@ -668,32 +770,41 @@ class PowerPointEngine:
         if not COM_AVAILABLE:
             raise RuntimeError("Live COM is required for native PDF export. Please ensure pywin32 is installed and PowerPoint is available.")
 
+        if filepath and not os.path.exists(os.path.abspath(filepath)):
+            raise FileNotFoundError(f"Presentation file not found: {filepath}")
+
         pythoncom.CoInitialize()
+        was_running = LivePowerPointSession.is_running()
         app = LivePowerPointSession.get_app(create_if_missing=True, visible=False)
         if not app:
             raise RuntimeError("Unable to launch Microsoft PowerPoint for PDF export.")
 
         close_after = False
         prs = None
-        if filepath:
-            abs_fp = os.path.abspath(filepath)
-            prs = LivePowerPointSession.find_presentation_by_path(abs_fp, app)
-            if not prs:
-                prs = app.Presentations.Open(abs_fp, WithWindow=False)
-                close_after = True
-        else:
-            prs = LivePowerPointSession.get_active_presentation(app)
-
-        if not prs:
-            raise RuntimeError("No open presentation found to export to PDF.")
-
         try:
+            if filepath:
+                abs_fp = os.path.abspath(filepath)
+                prs = LivePowerPointSession.find_presentation_by_path(abs_fp, app)
+                if not prs:
+                    prs = app.Presentations.Open(abs_fp, WithWindow=False)
+                    close_after = True
+            else:
+                prs = LivePowerPointSession.get_active_presentation(app)
+
+            if not prs:
+                raise RuntimeError("No open presentation found to export to PDF.")
+
             # ppSaveAsPDF = 32
             prs.SaveAs(out_pdf, 32)
         finally:
-            if close_after:
+            if close_after and prs is not None:
                 try:
                     prs.Close()
+                except Exception:
+                    pass
+            if not was_running:
+                try:
+                    app.Quit()
                 except Exception:
                     pass
 
@@ -722,35 +833,42 @@ class PowerPointEngine:
         out_dir = os.path.abspath(output_dir)
         os.makedirs(out_dir, exist_ok=True)
         img_format = image_format.upper()
-        if img_format not in ("PNG", "JPG", "JPEG"):
+        if img_format == "JPEG":
+            img_format = "JPG"
+        elif img_format not in ("PNG", "JPG"):
             img_format = "PNG"
 
         if not COM_AVAILABLE:
             raise RuntimeError("PowerPoint COM is required for slide image export.")
 
+        if filepath and not os.path.exists(os.path.abspath(filepath)):
+            raise FileNotFoundError(f"Presentation file not found: {filepath}")
+
         pythoncom.CoInitialize()
+        was_running = LivePowerPointSession.is_running()
         app = LivePowerPointSession.get_app(create_if_missing=True, visible=False)
         if not app:
             raise RuntimeError("Unable to launch PowerPoint for image export.")
 
         close_after = False
         prs = None
-        if filepath:
-            abs_fp = os.path.abspath(filepath)
-            prs = LivePowerPointSession.find_presentation_by_path(abs_fp, app)
-            if not prs:
-                prs = app.Presentations.Open(abs_fp, WithWindow=False)
-                close_after = True
-        else:
-            prs = LivePowerPointSession.get_active_presentation(app)
-
-        if not prs:
-            raise RuntimeError("No presentation found to export slides from.")
-
         generated_files = []
         try:
+            if filepath:
+                abs_fp = os.path.abspath(filepath)
+                prs = LivePowerPointSession.find_presentation_by_path(abs_fp, app)
+                if not prs:
+                    prs = app.Presentations.Open(abs_fp, WithWindow=False)
+                    close_after = True
+            else:
+                prs = LivePowerPointSession.get_active_presentation(app)
+
+            if not prs:
+                raise RuntimeError("No presentation found to export slides from.")
+
             if slide_index is not None:
-                # 1-indexed
+                if slide_index < 1 or slide_index > prs.Slides.Count:
+                    raise ValueError(f"Invalid slide index {slide_index}. Presentation has {prs.Slides.Count} slides.")
                 slide = prs.Slides(slide_index)
                 img_path = os.path.join(out_dir, f"slide_{slide_index}.{img_format.lower()}")
                 slide.Export(img_path, img_format, width, height)
@@ -762,9 +880,14 @@ class PowerPointEngine:
                     slide.Export(img_path, img_format, width, height)
                     generated_files.append(img_path)
         finally:
-            if close_after:
+            if close_after and prs is not None:
                 try:
                     prs.Close()
+                except Exception:
+                    pass
+            if not was_running:
+                try:
+                    app.Quit()
                 except Exception:
                     pass
 
@@ -869,11 +992,13 @@ class PowerPointEngine:
                 for tbl_idx, tbl in enumerate(s["tables"], start=1):
                     md_lines.append(f"\n**Table {tbl_idx}:**")
                     if tbl:
+                        def _esc_md(val: Any) -> str:
+                            return str(val).replace("|", "\\|").replace("\r\n", "<br>").replace("\n", "<br>")
                         headers = tbl[0]
-                        md_lines.append("| " + " | ".join(headers) + " |")
+                        md_lines.append("| " + " | ".join(_esc_md(h) for h in headers) + " |")
                         md_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
                         for r in tbl[1:]:
-                            md_lines.append("| " + " | ".join(r) + " |")
+                            md_lines.append("| " + " | ".join(_esc_md(c) for c in r) + " |")
 
             if include_notes and s["speaker_notes"]:
                 md_lines.append(f"\n> 📝 **Speaker Notes:** {s['speaker_notes']}")
@@ -885,20 +1010,7 @@ class PowerPointEngine:
     @classmethod
     def get_outline(cls, filepath: Optional[str] = None) -> Dict[str, Any]:
         """Extract high-level outline, slide titles, counts, and word statistics."""
-        target_path = os.path.abspath(filepath) if filepath else None
-        if not target_path or not os.path.exists(target_path):
-            if COM_AVAILABLE:
-                app = LivePowerPointSession.get_app(create_if_missing=False)
-                if app:
-                    prs_com = LivePowerPointSession.get_active_presentation(app)
-                    if prs_com:
-                        try:
-                            target_path = prs_com.FullName
-                        except Exception:
-                            pass
-
-        if not target_path or not os.path.exists(target_path):
-            raise FileNotFoundError(f"Presentation file not found: {filepath}")
+        target_path = cls._resolve_target_path(filepath)
 
         prs = pptx.Presentation(target_path)
         outline = []
@@ -942,7 +1054,9 @@ class PowerPointEngine:
     ) -> Dict[str, Any]:
         """Add a new slide with specified layout, title, and background."""
         target_path = os.path.abspath(filepath) if filepath else None
-        
+        if background_color:
+            hex_to_rgb_color(background_color)
+
         # COM Live Modification if active
         if COM_AVAILABLE:
             app = LivePowerPointSession.get_app(create_if_missing=False)
@@ -956,16 +1070,21 @@ class PowerPointEngine:
                         layout_val = 12
                     elif layout in ("two_content", "comparison"):
                         layout_val = 3
-                    
+
                     pos = slide_index if slide_index is not None else (prs_com.Slides.Count + 1)
+                    if pos < 1 or pos > prs_com.Slides.Count + 1:
+                        raise ValueError(f"Invalid slide_index {pos}. Valid range: 1..{prs_com.Slides.Count + 1}.")
                     slide = prs_com.Slides.Add(pos, layout_val)
                     if title and slide.Shapes.HasTitle:
-                        slide.Shapes.Title.TextFrame.TextRange.Text = title
+                        tr = slide.Shapes.Title.TextFrame.TextRange
+                        tr.Text = title
+                        if is_arabic_text(title):
+                            tr.ParagraphFormat.Alignment = 3
                     if background_color:
                         bgr = hex_to_bgr_int(background_color)
                         slide.Background.Fill.Solid()
                         slide.Background.Fill.ForeColor.RGB = bgr
-                    
+
                     if target_path:
                         prs_com.Save()
                     return {
@@ -980,15 +1099,25 @@ class PowerPointEngine:
             raise FileNotFoundError(f"Presentation file not found: {filepath}")
 
         prs = pptx.Presentation(target_path)
+        total_after = len(prs.slides) + 1
+        if slide_index is not None and (slide_index < 1 or slide_index > total_after):
+            raise ValueError(f"Invalid slide_index {slide_index}. Valid range: 1..{total_after}.")
+
         layout_idx = LAYOUT_MAP.get(layout.lower(), 1)
         if layout_idx >= len(prs.slide_layouts):
             layout_idx = 1
         slide_layout = prs.slide_layouts[layout_idx]
-        
+
         slide = prs.slides.add_slide(slide_layout)
-        
-        # If slide_index specified and not at end, python-pptx appends to end, we can record position
-        actual_index = len(prs.slides)
+
+        if slide_index is not None and slide_index < len(prs.slides):
+            sldId_lst = prs.slides._sldIdLst
+            new_elem = sldId_lst[-1]
+            sldId_lst.remove(new_elem)
+            sldId_lst.insert(slide_index - 1, new_elem)
+            actual_index = slide_index
+        else:
+            actual_index = len(prs.slides)
 
         if title and slide.shapes.title:
             slide.shapes.title.text = title
@@ -1050,16 +1179,31 @@ class PowerPointEngine:
 
         # Headless python-pptx duplication via COM fallback
         pythoncom.CoInitialize()
+        was_running = LivePowerPointSession.is_running()
         app = LivePowerPointSession.get_app(create_if_missing=True, visible=False)
-        prs_com = app.Presentations.Open(target_path, WithWindow=False)
+        if not app:
+            raise RuntimeError("Unable to launch PowerPoint for slide duplication.")
+        prs_com = None
         try:
+            prs_com = app.Presentations.Open(target_path, WithWindow=False)
+            if slide_index < 1 or slide_index > prs_com.Slides.Count:
+                raise ValueError(f"Invalid slide index {slide_index}. Presentation has {prs_com.Slides.Count} slides.")
             slide = prs_com.Slides(slide_index)
             dup = slide.Duplicate()
             prs_com.Save()
             total = prs_com.Slides.Count
             new_idx = dup.SlideIndex
         finally:
-            prs_com.Close()
+            if prs_com is not None:
+                try:
+                    prs_com.Close()
+                except Exception:
+                    pass
+            if not was_running:
+                try:
+                    app.Quit()
+                except Exception:
+                    pass
 
         return {
             "status": "success",
@@ -1131,6 +1275,11 @@ class PowerPointEngine:
             if app:
                 prs_com = LivePowerPointSession.find_presentation_by_path(target_path, app) if target_path else LivePowerPointSession.get_active_presentation(app)
                 if prs_com:
+                    total_slides = prs_com.Slides.Count
+                    if from_index < 1 or from_index > total_slides:
+                        raise ValueError(f"Invalid from_index {from_index}. Total slides: {total_slides}.")
+                    if to_index < 1 or to_index > total_slides:
+                        raise ValueError(f"Invalid to_index {to_index}. Total slides: {total_slides}.")
                     prs_com.Slides(from_index).MoveTo(to_index)
                     prs_com.Save()
                     return {
@@ -1169,34 +1318,51 @@ class PowerPointEngine:
         filepath: Optional[str] = None
     ) -> Dict[str, Any]:
         """Set background color for a specific slide or all slides."""
+        bgr = hex_to_bgr_int(color)
+        rgb = hex_to_rgb_color(color)
         target_path = os.path.abspath(filepath) if filepath else None
-        
-        # python-pptx
-        if target_path and os.path.exists(target_path):
-            prs = pptx.Presentation(target_path)
-            target_slides = [prs.slides[slide_index - 1]] if (slide_index and slide_index <= len(prs.slides)) else prs.slides
-            for s in target_slides:
-                bg = s.background
-                fill = bg.fill
-                fill.solid()
-                fill.fore_color.rgb = hex_to_rgb_color(color)
-            save_pptx_safely(prs, target_path)
 
-        # COM
+        # COM first if open in PowerPoint
         if COM_AVAILABLE:
             app = LivePowerPointSession.get_app(create_if_missing=False)
             if app:
                 prs_com = LivePowerPointSession.find_presentation_by_path(target_path, app) if target_path else LivePowerPointSession.get_active_presentation(app)
                 if prs_com:
-                    bgr = hex_to_bgr_int(color)
-                    if slide_index:
+                    if slide_index is not None:
+                        if slide_index < 1 or slide_index > prs_com.Slides.Count:
+                            raise ValueError(f"Invalid slide index {slide_index}. Total slides: {prs_com.Slides.Count}.")
                         prs_com.Slides(slide_index).Background.Fill.Solid()
                         prs_com.Slides(slide_index).Background.Fill.ForeColor.RGB = bgr
                     else:
                         for s in prs_com.Slides:
                             s.Background.Fill.Solid()
                             s.Background.Fill.ForeColor.RGB = bgr
-                    prs_com.Save()
+                    if target_path:
+                        prs_com.Save()
+                    return {
+                        "status": "success",
+                        "message": f"Background color '{color}' applied successfully.",
+                        "slide_index": slide_index or "all"
+                    }
+
+        # Headless python-pptx
+        if not target_path or not os.path.exists(target_path):
+            raise FileNotFoundError(f"Presentation file not found: {filepath}")
+
+        prs = pptx.Presentation(target_path)
+        if slide_index is not None:
+            if slide_index < 1 or slide_index > len(prs.slides):
+                raise ValueError(f"Invalid slide index {slide_index}. Total slides: {len(prs.slides)}.")
+            target_slides = [prs.slides[slide_index - 1]]
+        else:
+            target_slides = prs.slides
+
+        for s in target_slides:
+            bg = s.background
+            fill = bg.fill
+            fill.solid()
+            fill.fore_color.rgb = rgb
+        save_pptx_safely(prs, target_path)
 
         return {
             "status": "success",
@@ -1222,10 +1388,24 @@ class PowerPointEngine:
                 prs_com = LivePowerPointSession.find_presentation_by_path(target_path, app) if target_path else LivePowerPointSession.get_active_presentation(app)
                 if prs_com:
                     slide = prs_com.Slides(slide_index)
-                    existing = slide.NotesPage.Shapes.Placeholders(2).TextFrame.TextRange.Text if append else ""
+                    notes_ph = None
+                    try:
+                        notes_ph = slide.NotesPage.Shapes.Placeholders(2)
+                    except Exception:
+                        for sh in slide.NotesPage.Shapes:
+                            try:
+                                if sh.HasTextFrame and getattr(sh, "Type", None) == 14 and sh.PlaceholderFormat.Type == 2:
+                                    notes_ph = sh
+                                    break
+                            except Exception:
+                                pass
+                    if notes_ph is None:
+                        raise RuntimeError(f"Notes placeholder not found on slide {slide_index}.")
+                    existing = notes_ph.TextFrame.TextRange.Text if append else ""
                     new_text = f"{existing}\n{notes}".strip() if existing else notes
-                    slide.NotesPage.Shapes.Placeholders(2).TextFrame.TextRange.Text = new_text
-                    prs_com.Save()
+                    notes_ph.TextFrame.TextRange.Text = new_text
+                    if target_path:
+                        prs_com.Save()
                     return {
                         "status": "success",
                         "message": f"Speaker notes set for slide {slide_index} in live PowerPoint.",
@@ -1382,22 +1562,7 @@ class PowerPointEngine:
         filepath: Optional[str] = None
     ) -> Dict[str, Any]:
         """Add structured bullet points with multi-level nesting and styling."""
-        target_path = os.path.abspath(filepath) if filepath else None
-        
-        # python-pptx
-        if not target_path or not os.path.exists(target_path):
-            if COM_AVAILABLE:
-                app = LivePowerPointSession.get_app(create_if_missing=False)
-                if app:
-                    prs_com = LivePowerPointSession.get_active_presentation(app)
-                    if prs_com:
-                        try:
-                            target_path = prs_com.FullName
-                        except Exception:
-                            pass
-
-        if not target_path or not os.path.exists(target_path):
-            raise FileNotFoundError(f"Presentation file not found: {filepath}")
+        target_path = cls._resolve_target_path(filepath)
 
         prs = pptx.Presentation(target_path)
         if slide_index < 1 or slide_index > len(prs.slides):
@@ -1418,7 +1583,7 @@ class PowerPointEngine:
             
             if isinstance(item, dict):
                 text_val = item.get("text", "")
-                level = int(item.get("level", 0))
+                level = max(0, min(8, int(item.get("level", 0))))
                 item_bold = bool(item.get("bold", False))
                 item_color = item.get("color", font_color)
             else:
@@ -1427,7 +1592,7 @@ class PowerPointEngine:
             p.text = text_val
             p.level = level
             p.font.name = font_name
-            p.font.size = Pt(font_size - (level * 2))
+            p.font.size = Pt(max(8, font_size - (level * 2)))
             p.font.bold = item_bold
             p.font.color.rgb = hex_to_rgb_color(item_color)
             p.line_spacing = line_spacing
@@ -1573,20 +1738,7 @@ class PowerPointEngine:
         filepath: Optional[str] = None
     ) -> Dict[str, Any]:
         """Add modern executive KPI Metric Card with title, highlight value, description, and badge."""
-        target_path = os.path.abspath(filepath) if filepath else None
-        if not target_path or not os.path.exists(target_path):
-            if COM_AVAILABLE:
-                app = LivePowerPointSession.get_app(create_if_missing=False)
-                if app:
-                    prs_com = LivePowerPointSession.get_active_presentation(app)
-                    if prs_com:
-                        try:
-                            target_path = prs_com.FullName
-                        except Exception:
-                            pass
-
-        if not target_path or not os.path.exists(target_path):
-            raise FileNotFoundError(f"Presentation file not found: {filepath}")
+        target_path = cls._resolve_target_path(filepath)
 
         prs = pptx.Presentation(target_path)
         if slide_index < 1 or slide_index > len(prs.slides):
@@ -1696,19 +1848,7 @@ class PowerPointEngine:
             if not os.path.exists(local_img):
                 raise FileNotFoundError(f"Image file not found at: {local_img}")
 
-            if not target_path or not os.path.exists(target_path):
-                if COM_AVAILABLE:
-                    app = LivePowerPointSession.get_app(create_if_missing=False)
-                    if app:
-                        prs_com = LivePowerPointSession.get_active_presentation(app)
-                        if prs_com:
-                            try:
-                                target_path = prs_com.FullName
-                            except Exception:
-                                pass
-
-            if not target_path or not os.path.exists(target_path):
-                raise FileNotFoundError(f"Presentation file not found: {filepath}")
+            target_path = cls._resolve_target_path(filepath)
 
             prs = pptx.Presentation(target_path)
             if slide_index < 1 or slide_index > len(prs.slides):
@@ -1766,20 +1906,9 @@ class PowerPointEngine:
         filepath: Optional[str] = None
     ) -> Dict[str, Any]:
         """Add professionally styled table with header fills, zebra striping, and cell formatting."""
-        target_path = os.path.abspath(filepath) if filepath else None
-        if not target_path or not os.path.exists(target_path):
-            if COM_AVAILABLE:
-                app = LivePowerPointSession.get_app(create_if_missing=False)
-                if app:
-                    prs_com = LivePowerPointSession.get_active_presentation(app)
-                    if prs_com:
-                        try:
-                            target_path = prs_com.FullName
-                        except Exception:
-                            pass
-
-        if not target_path or not os.path.exists(target_path):
-            raise FileNotFoundError(f"Presentation file not found: {filepath}")
+        if not headers:
+            raise ValueError("Table headers cannot be empty.")
+        target_path = cls._resolve_target_path(filepath)
 
         prs = pptx.Presentation(target_path)
         if slide_index < 1 or slide_index > len(prs.slides):
@@ -1865,20 +1994,9 @@ class PowerPointEngine:
         filepath: Optional[str] = None
     ) -> Dict[str, Any]:
         """Add native PowerPoint chart (Column, Bar, Line, Pie, Doughnut, Area) with series data."""
-        target_path = os.path.abspath(filepath) if filepath else None
-        if not target_path or not os.path.exists(target_path):
-            if COM_AVAILABLE:
-                app = LivePowerPointSession.get_app(create_if_missing=False)
-                if app:
-                    prs_com = LivePowerPointSession.get_active_presentation(app)
-                    if prs_com:
-                        try:
-                            target_path = prs_com.FullName
-                        except Exception:
-                            pass
-
-        if not target_path or not os.path.exists(target_path):
-            raise FileNotFoundError(f"Presentation file not found: {filepath}")
+        if not categories or not series_data:
+            raise ValueError("Chart categories and series_data cannot be empty.")
+        target_path = cls._resolve_target_path(filepath)
 
         prs = pptx.Presentation(target_path)
         if slide_index < 1 or slide_index > len(prs.slides):
@@ -1935,20 +2053,7 @@ class PowerPointEngine:
         filepath: Optional[str] = None
     ) -> Dict[str, Any]:
         """Create visual roadmap / timeline slide with sequential milestone nodes and connectors."""
-        target_path = os.path.abspath(filepath) if filepath else None
-        if not target_path or not os.path.exists(target_path):
-            if COM_AVAILABLE:
-                app = LivePowerPointSession.get_app(create_if_missing=False)
-                if app:
-                    prs_com = LivePowerPointSession.get_active_presentation(app)
-                    if prs_com:
-                        try:
-                            target_path = prs_com.FullName
-                        except Exception:
-                            pass
-
-        if not target_path or not os.path.exists(target_path):
-            raise FileNotFoundError(f"Presentation file not found: {filepath}")
+        target_path = cls._resolve_target_path(filepath)
 
         prs = pptx.Presentation(target_path)
         if slide_index < 1 or slide_index > len(prs.slides):
@@ -2062,53 +2167,41 @@ class PowerPointEngine:
         filepath: Optional[str] = None
     ) -> Dict[str, Any]:
         """Search and replace text across all slides, text boxes, tables, and notes."""
-        target_path = os.path.abspath(filepath) if filepath else None
-        if not target_path or not os.path.exists(target_path):
-            if COM_AVAILABLE:
-                app = LivePowerPointSession.get_app(create_if_missing=False)
-                if app:
-                    prs_com = LivePowerPointSession.get_active_presentation(app)
-                    if prs_com:
-                        try:
-                            target_path = prs_com.FullName
-                        except Exception:
-                            pass
-
-        if not target_path or not os.path.exists(target_path):
-            raise FileNotFoundError(f"Presentation file not found: {filepath}")
+        if not find_text:
+            raise ValueError("find_text cannot be empty.")
+        target_path = cls._resolve_target_path(filepath)
 
         prs = pptx.Presentation(target_path)
         replacements_count = 0
         pattern = re.compile(re.escape(find_text), 0 if match_case else re.IGNORECASE)
 
+        def _replace_in_tf(tf) -> int:
+            count = 0
+            for paragraph in tf.paragraphs:
+                matched_in_runs = False
+                for run in paragraph.runs:
+                    new_txt, n = pattern.subn(replace_text, run.text)
+                    if n:
+                        run.text = new_txt
+                        count += n
+                        matched_in_runs = True
+                if not matched_in_runs and pattern.search(paragraph.text):
+                    new_txt, n = pattern.subn(replace_text, paragraph.text)
+                    if n:
+                        cls._set_paragraph_text_preserving_style(paragraph, new_txt)
+                        count += n
+            return count
+
         for slide in prs.slides:
-            # Check shapes and textframes
             for shape in slide.shapes:
                 if shape.has_text_frame:
-                    for paragraph in shape.text_frame.paragraphs:
-                        for run in paragraph.runs:
-                            if pattern.search(run.text):
-                                run.text = pattern.sub(replace_text, run.text)
-                                replacements_count += 1
-                
-                # Check tables
+                    replacements_count += _replace_in_tf(shape.text_frame)
                 if shape.has_table:
                     for row in shape.table.rows:
                         for cell in row.cells:
-                            for paragraph in cell.text_frame.paragraphs:
-                                for run in paragraph.runs:
-                                    if pattern.search(run.text):
-                                        run.text = pattern.sub(replace_text, run.text)
-                                        replacements_count += 1
-
-            # Check notes
+                            replacements_count += _replace_in_tf(cell.text_frame)
             if slide.has_notes_slide:
-                notes_tf = slide.notes_slide.notes_text_frame
-                for paragraph in notes_tf.paragraphs:
-                    for run in paragraph.runs:
-                        if pattern.search(run.text):
-                            run.text = pattern.sub(replace_text, run.text)
-                            replacements_count += 1
+                replacements_count += _replace_in_tf(slide.notes_slide.notes_text_frame)
 
         save_pptx_safely(prs, target_path)
         return {
@@ -2140,16 +2233,22 @@ class PowerPointEngine:
                 for shape in slide.shapes:
                     if shape.has_text_frame:
                         for paragraph in shape.text_frame.paragraphs:
-                            if tag in paragraph.text:
-                                paragraph.text = paragraph.text.replace(tag, str_val)
-                                total_replacements += 1
+                            cnt = paragraph.text.count(tag)
+                            if cnt:
+                                cls._set_paragraph_text_preserving_style(
+                                    paragraph, paragraph.text.replace(tag, str_val)
+                                )
+                                total_replacements += cnt
                     if shape.has_table:
                         for row in shape.table.rows:
                             for cell in row.cells:
                                 for paragraph in cell.text_frame.paragraphs:
-                                    if tag in paragraph.text:
-                                        paragraph.text = paragraph.text.replace(tag, str_val)
-                                        total_replacements += 1
+                                    cnt = paragraph.text.count(tag)
+                                    if cnt:
+                                        cls._set_paragraph_text_preserving_style(
+                                            paragraph, paragraph.text.replace(tag, str_val)
+                                        )
+                                        total_replacements += cnt
 
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         save_pptx_safely(prs, out_path)
@@ -2167,20 +2266,7 @@ class PowerPointEngine:
         filepath: Optional[str] = None
     ) -> Dict[str, Any]:
         """Apply cohesive color palette and styling to entire presentation."""
-        target_path = os.path.abspath(filepath) if filepath else None
-        if not target_path or not os.path.exists(target_path):
-            if COM_AVAILABLE:
-                app = LivePowerPointSession.get_app(create_if_missing=False)
-                if app:
-                    prs_com = LivePowerPointSession.get_active_presentation(app)
-                    if prs_com:
-                        try:
-                            target_path = prs_com.FullName
-                        except Exception:
-                            pass
-
-        if not target_path or not os.path.exists(target_path):
-            raise FileNotFoundError(f"Presentation file not found: {filepath}")
+        target_path = cls._resolve_target_path(filepath)
 
         palette = THEME_PALETTES.get(theme.lower(), THEME_PALETTES["modern_blue"])
         prs = pptx.Presentation(target_path)
@@ -2217,8 +2303,6 @@ class PowerPointEngine:
 
         stdout_buf = io.StringIO()
         stderr_buf = io.StringIO()
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
 
         local_env = {
             "pptx": pptx,
@@ -2244,7 +2328,7 @@ class PowerPointEngine:
                 exec(code, globals(), local_env)
             if prs and target_path:
                 save_pptx_safely(prs, target_path)
-        except Exception:
+        except (Exception, SystemExit):
             has_error = True
             stderr_buf.write(traceback.format_exc())
 
@@ -2287,9 +2371,14 @@ def powerpoint_status() -> str:
             f"- Active Slide Index: {status.get('active_slide_index', 'None')}"
         )
     else:
+        com_msg = (
+            "Available (PowerPoint will be launched if needed)."
+            if status.get("com_available")
+            else "Unavailable (pywin32 not installed or non-Windows OS)."
+        )
         return (
             "ℹ️ Microsoft PowerPoint is currently NOT running.\n"
-            "- COM automation: Available (PowerPoint will be launched if needed).\n"
+            f"- COM automation: {com_msg}\n"
             "- Headless file mode: Active (python-pptx can read/write files directly)."
         )
 

@@ -7,6 +7,10 @@ Verifies all 26 tools in live COM and headless modes.
 import os
 import sys
 import json
+import tempfile
+import unittest
+from unittest import mock
+import pptx
 from PIL import Image
 
 # Ensure UTF-8 output encoding on Windows consoles
@@ -41,11 +45,164 @@ def create_sample_image(path: str):
     img.save(path)
 
 
+class TestPowerPointUnitAndRegression(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.pptx_path = os.path.join(self.tmpdir.name, "unit.pptx")
+        srv.PowerPointEngine.create_presentation(filepath=self.pptx_path, title="Deck Title", visible=False)
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_hex_and_slide_index_validation(self):
+        with self.assertRaises(ValueError):
+            srv.clean_hex("zzzzzz")
+        # Invalid slide_index must raise instead of painting all slides or indexing negative
+        with self.assertRaises(ValueError):
+            srv.PowerPointEngine.set_slide_background("#112233", slide_index=99, filepath=self.pptx_path)
+        with self.assertRaises(ValueError):
+            srv.PowerPointEngine.set_slide_background("#112233", slide_index=0, filepath=self.pptx_path)
+
+    def test_missing_filepath_never_hijacks_active_com(self):
+        missing = os.path.join(self.tmpdir.name, "does_not_exist.pptx")
+        fake_prs = mock.Mock(FullName=self.pptx_path)
+        fake_app = mock.Mock()
+        with mock.patch.object(srv.LivePowerPointSession, "get_app", return_value=fake_app), \
+             mock.patch.object(srv.LivePowerPointSession, "get_active_presentation", return_value=fake_prs):
+            for fn in (
+                lambda: srv.PowerPointEngine.get_outline(filepath=missing),
+                lambda: srv.PowerPointEngine.add_bullet_points(["a"], filepath=missing),
+                lambda: srv.PowerPointEngine.search_and_replace("x", "y", filepath=missing),
+                lambda: srv.PowerPointEngine.apply_theme("dark_tech", filepath=missing),
+            ):
+                with self.assertRaises(FileNotFoundError):
+                    fn()
+
+    def test_add_slide_position_and_bullets_min_font(self):
+        res = srv.PowerPointEngine.add_slide(filepath=self.pptx_path, title="Inserted First", slide_index=1)
+        self.assertEqual(res["slide_index"], 1)
+        outline = srv.PowerPointEngine.get_outline(filepath=self.pptx_path)
+        self.assertEqual(outline["outline"][0]["title"], "Inserted First")
+
+        # Out-of-range indent level (>8) and resulting font size must clamp safely
+        srv.PowerPointEngine.add_bullet_points([{"text": "Deep", "level": 10}], slide_index=1, font_size=12, filepath=self.pptx_path)
+        prs = pptx.Presentation(self.pptx_path)
+        last_shape = prs.slides[0].shapes[-1]
+        self.assertEqual(last_shape.text_frame.paragraphs[0].level, 8)
+        self.assertEqual(last_shape.text_frame.paragraphs[0].font.size, srv.Pt(8))
+
+    def test_search_replace_split_runs_and_fill_template_counts_and_md_escape(self):
+        prs = pptx.Presentation(self.pptx_path)
+        slide = prs.slides[0]
+        tb = slide.shapes.add_textbox(srv.Inches(1), srv.Inches(2), srv.Inches(5), srv.Inches(1))
+        p = tb.text_frame.paragraphs[0]
+        r1 = p.add_run()
+        r1.text = "Hello "
+        r1.font.bold = True
+        r2 = p.add_run()
+        r2.text = "World! {{tag}} and {{tag}}"
+        srv.save_pptx_safely(prs, self.pptx_path)
+
+        with self.assertRaises(ValueError):
+            srv.PowerPointEngine.search_and_replace("", "x", filepath=self.pptx_path)
+
+        sr = srv.PowerPointEngine.search_and_replace("Hello World!", "Hi Team!", filepath=self.pptx_path)
+        self.assertEqual(sr["replacements_count"], 1)
+
+        out_filled = os.path.join(self.tmpdir.name, "filled.pptx")
+        ft = srv.PowerPointEngine.fill_template(self.pptx_path, out_filled, {"tag": "OK"})
+        self.assertEqual(ft["replacements_made"], 2)
+        prs_f = pptx.Presentation(out_filled)
+        # Font styling on preserved paragraph must remain bold
+        self.assertTrue(prs_f.slides[0].shapes[-1].text_frame.paragraphs[0].runs[0].font.bold)
+
+        # Table markdown escaping & empty table/chart guards
+        srv.PowerPointEngine.add_table(["Col|1", "Col2"], [["a\nb", "c|d"]], slide_index=1, filepath=out_filled)
+        md = srv.PowerPointEngine.read_presentation(filepath=out_filled, output_format="markdown")
+        self.assertIn("Col\\|1", md)
+        self.assertIn("a<br>b", md)
+        with self.assertRaises(ValueError):
+            srv.PowerPointEngine.add_table([], [[]], filepath=out_filled)
+        with self.assertRaises(ValueError):
+            srv.PowerPointEngine.add_chart("column", [], [], filepath=out_filled)
+
+    def test_execute_script_handles_system_exit_and_com_cleanup_mocks(self):
+        res = srv.PowerPointEngine.execute_script("import sys; sys.exit(2)")
+        self.assertEqual(res["status"], "error")
+
+        # find_presentation_by_path must not match wrong folder with same basename
+        other = mock.Mock(FullName=os.path.join("C:\\other_dir", "unit.pptx"), Name="unit.pptx")
+        fake_app = mock.Mock()
+        fake_app.Presentations = mock.Mock(Count=1)
+        fake_app.Presentations.side_effect = lambda idx: other
+        self.assertIsNone(srv.LivePowerPointSession.find_presentation_by_path(self.pptx_path, fake_app))
+
+        # save_pptx_safely must refuse closing dirty live presentation
+        dirty_prs = mock.Mock(FullName=self.pptx_path, Saved=False)
+        dirty_app = mock.Mock()
+        dirty_app.Presentations = mock.Mock(Count=1)
+        dirty_app.Presentations.side_effect = lambda idx: dirty_prs
+        prs = pptx.Presentation(self.pptx_path)
+        with mock.patch.object(srv.LivePowerPointSession, "get_app", return_value=dirty_app):
+            with self.assertRaises(RuntimeError):
+                srv.save_pptx_safely(prs, self.pptx_path)
+            dirty_prs.Close.assert_not_called()
+
+        # export_pdf & export_slide_images must quit newly launched hidden PowerPoint
+        fake_slide = mock.Mock()
+        fake_com_prs = mock.Mock()
+        fake_com_prs.Slides = mock.Mock(Count=1)
+        fake_com_prs.Slides.side_effect = lambda idx: fake_slide
+        exp_app = mock.Mock()
+        exp_app.Presentations = mock.Mock(Count=0)
+        exp_app.Presentations.Open = mock.Mock(return_value=fake_com_prs)
+        pdf_path = os.path.join(self.tmpdir.name, "exp.pdf")
+        with mock.patch.object(srv, "COM_AVAILABLE", True), \
+             mock.patch.object(srv.LivePowerPointSession, "is_running", return_value=False), \
+             mock.patch.object(srv.LivePowerPointSession, "get_app", return_value=exp_app):
+            # JPEG filter must map to JPG in COM Slide.Export
+            srv.PowerPointEngine.export_slide_images(self.tmpdir.name, filepath=self.pptx_path, slide_index=1, image_format="JPEG")
+            fake_slide.Export.assert_called_once()
+            self.assertEqual(fake_slide.Export.call_args[0][1], "JPG")
+            fake_com_prs.Close.assert_called_once()
+            exp_app.Quit.assert_called_once()
+
+            fake_com_prs.SaveAs.side_effect = lambda path, fmt: open(path, "wb").write(b"%PDF")
+            exp_app.Quit.reset_mock()
+            res_pdf = srv.PowerPointEngine.export_pdf(pdf_path, filepath=self.pptx_path)
+            self.assertEqual(res_pdf["status"], "success")
+            exp_app.Quit.assert_called_once()
+
+
 def run_tests():
     print("=======================================================")
     print("   POWERPOINT MCP SERVER ENTERPRISE VERIFICATION SUITE  ")
     print("=======================================================")
 
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestPowerPointUnitAndRegression)
+    unit_res = unittest.TextTestRunner(verbosity=2).run(suite)
+    if not unit_res.wasSuccessful():
+        sys.exit(1)
+
+    try:
+        _run_e2e()
+    finally:
+        for f in [TEST_FILE, TEST_SAVED_AS, TEST_TEMPLATE, TEST_FILLED, TEST_PDF, TEST_LOCAL_IMG]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+        if os.path.exists(TEST_IMG_DIR):
+            try:
+                for f in os.listdir(TEST_IMG_DIR):
+                    os.remove(os.path.join(TEST_IMG_DIR, f))
+                os.rmdir(TEST_IMG_DIR)
+            except Exception:
+                pass
+
+
+def _run_e2e():
     create_sample_image(TEST_LOCAL_IMG)
 
     # 1. Status Check

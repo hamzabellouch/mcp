@@ -19,11 +19,11 @@ By combining interactive live desktop automation (via Windows COM and GUI RPC br
 
 | MCP Server | Directory | Tools Count | Architecture / Engine | Primary Capabilities |
 | :--- | :--- | :---: | :--- | :--- |
-| **[Word MCP](Word/)** | [`./Word`](Word/) | **22 Tools** | Live Windows COM + Headless `python-docx` + `lxml` | Document creation, typography, tables, TOC, watermarks, RTL/Arabic, comments, template filling, PDF export. |
+| **[Word MCP](Word/)** | [`./Word`](Word/) | **24 Tools** | Live Windows COM + Headless `python-docx` + `lxml` | Document creation, typography, inline rich formatting, tables/merges, TOC, watermarks, RTL/Arabic, comments, `.docx`/`.dotx` templates, PDF export. |
 | **[PowerPoint MCP](Powerpoint/)** | [`./Powerpoint`](Powerpoint/) | **26 Tools** | Live Windows COM + Headless `python-pptx` | Presentation lifecycle, slide layout, KPI cards, charts, roadmaps/timelines, themes, regex replace, slide PNG/PDF export. |
-| **[Excel MCP](Excel/)** | [`./Excel`](Excel/) | **13 Tools** | Live Windows COM + Headless `openpyxl` | Workbook creation, range read/write, styling, formula execution, column/pie/line charts, statistical data profiling. |
-| **[FreeCAD MCP](FreeCAD/)** | [`./FreeCAD`](FreeCAD/) | **29 Tools** | Live Qt GUI RPC (`2607`) + Headless `FreeCADCmd` | 3D CAD modeling, boolean operations, sketch extrusion, TechDraw 2D sheets, CalculiX FEM structural simulations, mass analysis. |
-| **[Blender MCP](Blender/)** | [`./Blender`](Blender/) | **7 Tools** | FastMCP stdio + Blender Main-Thread Bridge (`9876`) | 3D primitives, PBR material creation, model importing (GLTF/OBJ/FBX), camera & lighting setup, Cycles/Eevee rendering. |
+| **[Excel MCP](Excel/)** | [`./Excel`](Excel/) | **14 Tools** | Live Windows COM + Headless `openpyxl` | Workbook creation, range read/write, styling, formula execution, column/pie/line/scatter/doughnut charts, statistical data profiling. |
+| **[FreeCAD MCP](FreeCAD/)** | [`./FreeCAD`](FreeCAD/) | **33 Tools** | Live Qt GUI RPC (`2607`) + Headless `FreeCADCmd` | 3D CAD modeling, boolean operations, sketch extrusion, TechDraw 2D sheets, CalculiX FEM structural simulations, mass analysis. |
+| **[Blender MCP](Blender/)** | [`./Blender`](Blender/) | **8 Tools** | FastMCP stdio + Blender Main-Thread Bridge (`9876`) | 3D primitives, PBR material creation, model importing (GLTF/OBJ/FBX), camera & lighting setup, Cycles/Eevee rendering. |
 
 ## 🚀 Quick Setup & Client Configuration
 
@@ -39,17 +39,17 @@ Located at:
   "mcpServers": {
     "word": {
       "command": "python",
-      "args": ["-m", "word_mcp_server"],
+      "args": ["-m", "word_mcp_servers"],
       "cwd": "/path/to/mcp/Word"
     },
     "powerpoint": {
       "command": "python",
-      "args": ["-m", "powerpoint_mcp_server"],
+      "args": ["-m", "powerpoint_mcp_servers"],
       "cwd": "/path/to/mcp/Powerpoint"
     },
     "excel": {
       "command": "python",
-      "args": ["-m", "excel_mcp_server"],
+      "args": ["-m", "excel_mcp_servers"],
       "cwd": "/path/to/mcp/Excel"
     },
     "freecad": {
@@ -72,15 +72,15 @@ Located at:
   "mcpServers": {
     "word": {
       "command": "python",
-      "args": ["/path/to/mcp/Word/word_mcp_server.py"]
+      "args": ["/path/to/mcp/Word/word_mcp_servers.py"]
     },
     "powerpoint": {
       "command": "python",
-      "args": ["/path/to/mcp/Powerpoint/powerpoint_mcp_server.py"]
+      "args": ["/path/to/mcp/Powerpoint/powerpoint_mcp_servers.py"]
     },
     "excel": {
       "command": "python",
-      "args": ["/path/to/mcp/Excel/excel_mcp_server.py"]
+      "args": ["/path/to/mcp/Excel/excel_mcp_servers.py"]
     },
     "freecad": {
       "command": "python",
@@ -100,15 +100,15 @@ Located at:
   "mcpServers": {
     "word": {
       "command": "python",
-      "args": ["/path/to/mcp/Word/word_mcp_server.py"]
+      "args": ["/path/to/mcp/Word/word_mcp_servers.py"]
     },
     "powerpoint": {
       "command": "python",
-      "args": ["/path/to/mcp/Powerpoint/powerpoint_mcp_server.py"]
+      "args": ["/path/to/mcp/Powerpoint/powerpoint_mcp_servers.py"]
     },
     "excel": {
       "command": "python",
-      "args": ["/path/to/mcp/Excel/excel_mcp_server.py"]
+      "args": ["/path/to/mcp/Excel/excel_mcp_servers.py"]
     },
     "freecad": {
       "command": "python",
@@ -129,42 +129,45 @@ mcp/
 ├── .gitignore               # Unified monorepo ignore rules
 ├── README.md                # Main suite documentation & overview
 │
-├── Word/                    # Microsoft Word MCP Server (22 tools)
-│   ├── word_engine.py       # Dual COM & python-docx engine
-│   ├── word_mcp_server.py   # FastMCP server definition
-│   ├── test_mcp.py          # Verification test suite (16 tests)
+├── Word/                    # Microsoft Word MCP Server (24 tools)
+│   ├── word_mcp_servers.py  # Unified COM, python-docx & FastMCP server
+│   ├── requirements.txt     # Python dependencies
 │   ├── pyproject.toml       # Package metadata
 │   └── README.md            # Word server documentation
 │
-├── Powerpoint/              # PowerPoint MCP Server (26 tools)
-│   ├── powerpoint_engine.py # Dual COM & python-pptx engine
-│   ├── powerpoint_mcp_server.py # FastMCP server definition
-│   ├── test_mcp.py          # Verification test suite (26 tools)
-│   ├── pyproject.toml       # Package metadata
-│   └── README.md            # PowerPoint server documentation
+├── Powerpoint/                # PowerPoint MCP Server (26 tools)
+│   ├── powerpoint_mcp_servers.py # Unified COM, python-pptx & FastMCP server
+│   ├── requirements.txt       # Python dependencies
+│   ├── pyproject.toml         # Package metadata
+│   └── README.md              # PowerPoint server documentation
 │
-├── Excel/                   # Microsoft Excel MCP Server (13 tools)
-│   ├── excel_engine.py      # Dual COM & openpyxl engine
-│   ├── excel_mcp_server.py  # FastMCP server definition
-│   ├── test_mcp.py          # Verification test suite (9 suites)
-│   ├── pyproject.toml       # Package metadata
-│   └── README.md            # Excel server documentation
+├── Excel/                     # Microsoft Excel MCP Server (14 tools)
+│   ├── excel_mcp_servers.py   # Unified COM, openpyxl & FastMCP server
+│   ├── requirements.txt       # Python dependencies
+│   ├── pyproject.toml         # Package metadata
+│   └── README.md              # Excel server documentation
 │
-├── FreeCAD/                 # FreeCAD Engineering MCP Server (29 tools)
-│   ├── addon/               # FreeCAD GUI XML-RPC Addon & Bridge
-│   ├── freecad_engine.py    # Headless & RPC execution coordinator
-│   ├── freecad_mcp_server.py# FastMCP server definition
-│   ├── test_mcp.py          # Integration verification suite
-│   ├── pyproject.toml       # Package metadata
-│   └── README.md            # FreeCAD server documentation
+├── FreeCAD/                   # FreeCAD Engineering MCP Server (33 tools)
+│   ├── add-on/                # FreeCAD GUI XML-RPC Addon & Bridge
+│   ├── freecad_mcp_server.py  # Unified Headless, RPC & FastMCP server
+│   ├── requirements.txt       # Python dependencies
+│   ├── pyproject.toml         # Package metadata
+│   └── README.md              # FreeCAD server documentation
 │
-└── Blender/                 # Blender 3D MCP Server (7 tools)
-    ├── Add-on/blender_addon.py     # Blender main-thread HTTP bridge addon
-    ├── blender_mcp_server.py# FastMCP server definition
-    ├── test_mcp.py          # Unit & mocked integration suite (20 tests)
-    ├── pyproject.toml       # Package metadata
-    ├── assets/              # Showcase and render previews
-    └── README.md            # Blender server documentation
+├── Blender/                   # Blender 3D MCP Server (8 tools)
+│   ├── Add-on/blender_addon.py# Blender main-thread HTTP bridge addon
+│   ├── blender_mcp_server.py  # FastMCP server definition
+│   ├── pyproject.toml         # Package metadata
+│   ├── assets/                # Showcase and render previews
+│   └── README.md              # Blender server documentation
+│
+└── Tests/                     # Centralized verification test suite
+    ├── run_all.py             # Unified test runner for all 5 MCPs
+    ├── test_word.py
+    ├── test_powerpoint.py
+    ├── test_excel.py
+    ├── test_freecad.py
+    └── test_blender.py
 ```
 
 ## 🛠️ Global Installation & Dependencies

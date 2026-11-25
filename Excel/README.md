@@ -184,10 +184,10 @@ Add to your extension's MCP configuration settings:
 
 ## 🧪 Verification & Testing
 
-Run the included automated verification suite to test all 13 tools and engines:
+Run the included automated verification suite from the repository root to test all 14 tools and engines:
 
 ```bash
-python test_mcp.py
+python Tests/run_all.py excel
 ```
 
 Expected output:

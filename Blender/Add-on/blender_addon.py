@@ -115,7 +115,7 @@ def execute_code_in_main_thread(code_str):
         compiled = compile(code_str, "<mcp_exec>", "exec")
         exec(compiled, exec_globals)
         success = True
-    except Exception as e:
+    except (Exception, SystemExit) as e:
         error_msg = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
     finally:
         sys.stdout = old_stdout
@@ -168,6 +168,8 @@ def render_scene_main_thread(payload):
         import tempfile
         temp_dir = tempfile.gettempdir()
         output_path = os.path.join(temp_dir, f"mcp_render_{int(time.time())}.png")
+    else:
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         
     res_x = payload.get("resolution_x")
     res_y = payload.get("resolution_y")
@@ -232,8 +234,12 @@ class MCPBridgeHandler(http.server.BaseHTTPRequestHandler):
         if client_ip not in ("127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"):
             return False, 403, "Access denied: Only local connections are allowed."
 
-        host_header = self.headers.get("Host", "").split(":")[0].strip().lower()
-        if host_header not in ("localhost", "127.0.0.1", "::1", "[::1]"):
+        raw_host = self.headers.get("Host", "").strip().lower()
+        if raw_host.startswith("["):
+            host_header = raw_host[1:].split("]", 1)[0]
+        else:
+            host_header = raw_host.rsplit(":", 1)[0]
+        if host_header not in ("localhost", "127.0.0.1", "::1"):
             return False, 400, "Access denied: Invalid Host header."
 
         origin = self.headers.get("Origin")
@@ -301,7 +307,15 @@ class MCPBridgeHandler(http.server.BaseHTTPRequestHandler):
             return
 
         try:
-            content_length = int(self.headers.get('Content-Length', 0))
+            raw_len = self.headers.get('Content-Length', '0')
+            try:
+                content_length = int(raw_len)
+            except (TypeError, ValueError):
+                self._send_json_response(400, {"error": "Invalid Content-Length header"})
+                return
+            if content_length < 0:
+                self._send_json_response(400, {"error": "Negative Content-Length header"})
+                return
             post_data = self.rfile.read(content_length) if content_length > 0 else b""
             
             payload = {}
@@ -378,7 +392,9 @@ def stop_server():
     if server_thread:
         server_thread.join(timeout=1.0)
         server_thread = None
-        
+    if bpy.app.timers.is_registered(process_queue_timer):
+        bpy.app.timers.unregister(process_queue_timer)
+
     print("[Blender MCP Bridge] Server stopped")
     return True, "Server stopped"
 
@@ -471,8 +487,10 @@ def unregister():
     stop_server()
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
-    del bpy.types.Scene.mcp_host
-    del bpy.types.Scene.mcp_port
+    if hasattr(bpy.types.Scene, "mcp_host"):
+        del bpy.types.Scene.mcp_host
+    if hasattr(bpy.types.Scene, "mcp_port"):
+        del bpy.types.Scene.mcp_port
 
 
 if __name__ == "__main__":

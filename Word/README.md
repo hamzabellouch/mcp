@@ -11,7 +11,7 @@ Empower LLMs and AI agents to create, format, and manipulate Microsoft Word docu
 
 ## Overview
 
-**Microsoft Word MCP Server (Enterprise Edition)** is a robust, enterprise-grade Model Context Protocol (MCP) server providing 21 specialized tools (plus an opt-in 22nd, `word_execute_script`) for complete document generation, styling, and management.
+**Microsoft Word MCP Server (Enterprise Edition)** is a robust, enterprise-grade Model Context Protocol (MCP) server providing 23 specialized tools (plus an opt-in 24th, `word_execute_script`) for complete document generation, styling, editing, and management.
 
 It combines interactive live desktop control via Windows COM with cross-platform headless document processing via `python-docx` and `lxml`. AI assistants can construct formatted reports, edit tables, manage dynamic tables of contents (TOC), insert watermarks, and export print-ready PDFs through simple natural language prompts.
 
@@ -27,7 +27,7 @@ This server is powered by a robust dual-engine design that automatically selects
                                      ▼
                   ┌─────────────────────────────────────┐
                   │           Word MCP Server           │
-                  │        (21 + 1 opt-in Tools)        │
+                  │        (23 + 1 opt-in Tools)        │
                   └──────────────────┬──────────────────┘
                                      │
                  ┌───────────────────┴───────────────────┐
@@ -53,7 +53,7 @@ This server is powered by a robust dual-engine design that automatically selects
    - Built on top of `python-docx` and `lxml` for lightning-fast server-side processing without requiring Microsoft Office.
    - Ideal for CI/CD pipelines, Docker containers, cloud environments, batch document generation, and template rendering across Windows, macOS, and Linux.
 
-## 🛠️ Complete Tool Catalog (21 Tools + 1 opt-in)
+## 🛠️ Complete Tool Catalog (23 Tools + 1 opt-in)
 
 ### 1. Core Document Management
 
@@ -66,19 +66,21 @@ This server is powered by a robust dual-engine design that automatically selects
 | `word_get_outline` | Extract the hierarchical heading outline, word count, paragraph count, and section stats. | `filepath` |
 | `word_save_document` | Save the current active document or save to a new target path. | `save_as_path`, `filepath` |
 | `word_export_pdf` | Export documents to high-fidelity PDF using Word's native rendering engine. | `output_pdf_path`, `filepath` |
+| `word_clear_document` | Clear all body content (and optionally headers/footers) to leave a clean blank page. | `filepath`, `include_headers_footers` |
 
 ### 2. Rich Content & Formatting
 
 | Tool Name | Description | Key Parameters |
 | :--- | :--- | :--- |
-| `word_add_heading` | Insert styled headings (Levels 1–6) with customizable colors, alignment, and spacing. | `text`, `level`, `filepath`, `align`, `color` |
-| `word_add_paragraph` | Add rich text paragraphs with precise control over font name, size, bold, italic, color, highlights, and line spacing. | `text`, `bold`, `italic`, `font_size`, `font_name`, `font_color`, `highlight_color`, `align` |
+| `word_add_heading` | Insert styled headings (Levels 1–6) at start, end, or a specific paragraph index with auto-RTL support. | `text`, `level`, `filepath`, `align`, `color`, `position`, `paragraph_index` |
+| `word_add_paragraph` | Add rich text paragraphs with optional inline markdown (`**bold**`, `*italic*`, `` `code` ``, `[links](url)`), font, color, highlights, and positioning. | `text`, `bold`, `italic`, `font_size`, `font_name`, `font_color`, `highlight_color`, `align`, `rich_formatting`, `position`, `paragraph_index` |
+| `word_modify_paragraph` | Edit text, toggle RTL/alignment or formatting of an existing paragraph, or delete it by index or search text. | `paragraph_index`, `target_text`, `new_text`, `delete`, `align`, `rtl`, `bold`, `font_color` |
 | `word_add_bullet_list` | Insert formatted bulleted or numbered lists. | `items`, `filepath`, `list_type` |
 | `word_add_callout_box` | Insert modern highlighted callout boxes (`info`, `tip`, `warning`, `important`, `quote`). | `text`, `title`, `box_type`, `bg_color`, `border_color` |
-| `word_add_table` | Insert professional tables with customizable header styling, column widths, and alternating row shading (zebra striping). | `headers`, `data`, `header_bg_color`, `header_font_color`, `alternate_row_color`, `col_widths` |
+| `word_add_table` | Insert professional tables with customizable header styling, column widths, alternating row shading, and cell merges. | `headers`, `data`, `header_bg_color`, `header_font_color`, `alternate_row_color`, `col_widths`, `merges` |
 | `word_add_image` | Insert images with custom width/height dimensions, alignment, and figure captions. | `image_path`, `width_inches`, `height_inches`, `caption`, `align` |
 | `word_add_page_break` | Insert a clean page break into the document. | `filepath` |
-| `word_search_and_replace`| Smart find-and-replace across all paragraphs and tables with case matching. | `find_text`, `replace_text`, `match_case`, `replace_all` |
+| `word_search_and_replace`| Smart find-and-replace across body, tables, headers, and footers (including >255-char strings in COM). | `find_text`, `replace_text`, `match_case`, `replace_all` |
 
 ### 3. Enterprise & Layout Configuration
 
@@ -154,7 +156,7 @@ pip install -e .
 word-mcp
 
 # Or run directly with Python
-python word_mcp_server.py
+python word_mcp_servers.py
 ```
 
 ## 🔌 Client Configurations
@@ -170,7 +172,7 @@ Add the Word MCP Server to your preferred AI agent environment using the snippet
       "command": "python",
       "args": [
         "-m",
-        "word_mcp_server"
+        "word_mcp_servers"
       ],
       "env": {
         "PYTHONIOENCODING": "utf-8"
@@ -188,7 +190,7 @@ Add the Word MCP Server to your preferred AI agent environment using the snippet
     "word": {
       "command": "python",
       "args": [
-        "/path/to/word-mcp-server/word_mcp_server.py"
+        "/path/to/word-mcp-server/word_mcp_servers.py"
       ],
       "env": {
         "PYTHONIOENCODING": "utf-8",
@@ -207,7 +209,7 @@ Add the Word MCP Server to your preferred AI agent environment using the snippet
     "word-mcp": {
       "command": "python",
       "args": [
-        "/path/to/word-mcp-server/word_mcp_server.py"
+        "/path/to/word-mcp-server/word_mcp_servers.py"
       ],
       "env": {
         "PYTHONIOENCODING": "utf-8"
@@ -225,7 +227,7 @@ Add the Word MCP Server to your preferred AI agent environment using the snippet
     "word": {
       "command": "python",
       "args": [
-        "/path/to/word-mcp-server/word_mcp_server.py"
+        "/path/to/word-mcp-server/word_mcp_servers.py"
       ],
       "env": {
         "PYTHONIOENCODING": "utf-8",
@@ -244,7 +246,7 @@ Add the Word MCP Server to your preferred AI agent environment using the snippet
     "word": {
       "command": "python",
       "args": [
-        "/path/to/word-mcp-server/word_mcp_server.py"
+        "/path/to/word-mcp-server/word_mcp_servers.py"
       ],
       "disabled": false,
       "autoApprove": []
@@ -255,20 +257,19 @@ Add the Word MCP Server to your preferred AI agent environment using the snippet
 
 ## 🧪 Verification & Testing
 
-Unit tests (any OS, use a fake Word, verify the live/headless safety rules):
+Run the Word verification suite (covers all 22 tools, headless generation, template rendering, and mocked live COM safety rules; on Windows when Word is idle/reachable it also tests live PDF export):
 
 ```bash
-pip install pytest
-python -m pytest -q tests
+python ../Tests/run_all.py word
 ```
 
-End-to-end smoke test of all tools (on Windows with Word installed this also exercises live COM and PDF export; on other systems PDF export is skipped):
+Or directly:
 
 ```bash
-python test_mcp.py
+python ../Tests/test_word.py
 ```
 
-The script exits with a non-zero code and lists every failing tool if anything fails.
+The script exits with a non-zero code and reports any failing tool or assertion if anything fails.
 
 > [!WARNING]
 > Document generation and template variable substitution can modify files on disk. There is always a possibility of error, so we assume no responsibility for any inaccuracies.

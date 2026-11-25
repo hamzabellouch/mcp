@@ -164,10 +164,10 @@ Add to MCP settings:
 
 ## 🧪 Testing
 
-Run the automated test suite to verify FastMCP tool registration, argument escaping, and offline error recovery:
+Run the automated test suite from the repository root to verify FastMCP tool registration, argument escaping, and offline error recovery:
 
 ```bash
-python test_mcp.py
+python Tests/run_all.py blender
 ```
 
 ## 💡 Prompt Examples

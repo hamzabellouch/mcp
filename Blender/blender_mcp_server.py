@@ -66,7 +66,7 @@ def blender_status() -> str:
     Returns the connection status, Blender version, and active scene info.
     """
     res = _send_request("/status", method="GET", timeout=5.0)
-    if "error" in res and not res.get("status"):
+    if res.get("error") and not res.get("status"):
         return f"❌ Disconnected: {res['error']}"
     return f"✅ Connected to Blender {res.get('blender_version', 'Unknown')}! Status: {res.get('status', 'online')}"
 
@@ -78,7 +78,7 @@ def blender_get_scene_summary() -> str:
     cameras, lights, materials, active object, and render configuration.
     """
     res = _send_request("/scene_info", method="GET", timeout=10.0)
-    if "error" in res and not res.get("scene_name"):
+    if res.get("error") and not res.get("scene_name"):
         return f"Error fetching scene info: {res['error']}"
     
     return json.dumps(res, indent=2, ensure_ascii=False)
@@ -94,8 +94,9 @@ def blender_execute_script(code: str) -> str:
         code: Python script string using bpy (e.g. 'import bpy\\nbpy.ops.mesh.primitive_cube_add()')
     """
     res = _send_request("/execute", method="POST", payload={"code": code}, timeout=30.0)
-    if "error" in res and not res.get("success"):
-        return f"❌ Execution Failed / Error:\n{res['error']}"
+    if res.get("error") or res.get("success") is False:
+        err_detail = res.get("error") or res.get("stderr") or "Unknown execution error"
+        return f"❌ Execution Failed / Error:\n{err_detail}"
     
     output_parts = []
     if res.get("stdout"):
@@ -155,14 +156,17 @@ def blender_create_primitive(
         script += f"bpy.ops.mesh.primitive_cone_add(radius1={size_val/2.0}, depth={size_val}, location={loc_repr}, rotation={rot_repr}, scale={scl_repr})\n"
     elif ptype == "torus":
         script += f"bpy.ops.mesh.primitive_torus_add(major_radius={size_val/2.0}, minor_radius={size_val/8.0}, location={loc_repr}, rotation={rot_repr})\n"
+        script += f"if bpy.context.active_object:\n    bpy.context.active_object.scale = {scl_repr}\n"
     elif ptype == "plane":
         script += f"bpy.ops.mesh.primitive_plane_add(size={size_val}, location={loc_repr}, rotation={rot_repr}, scale={scl_repr})\n"
     elif ptype in ("monkey", "suzanne"):
         script += f"bpy.ops.mesh.primitive_monkey_add(size={size_val}, location={loc_repr}, rotation={rot_repr}, scale={scl_repr})\n"
     elif ptype == "light":
-        script += f"bpy.ops.object.light_add(type='POINT', location={loc_repr})\n"
+        script += f"bpy.ops.object.light_add(type='POINT', location={loc_repr}, rotation={rot_repr})\n"
+        script += f"if bpy.context.active_object:\n    bpy.context.active_object.scale = {scl_repr}\n"
     elif ptype == "camera":
         script += f"bpy.ops.object.camera_add(location={loc_repr}, rotation={rot_repr})\n"
+        script += f"if bpy.context.active_object:\n    bpy.context.active_object.scale = {scl_repr}\n"
     else:
         return f"❌ Unsupported primitive type: '{primitive_type}'. Supported types: cube, uv_sphere, ico_sphere, cylinder, cone, torus, plane, monkey, light, camera."
 
@@ -221,6 +225,7 @@ if not obj:
 mat = bpy.data.materials.get(mat_name)
 if not mat:
     mat = bpy.data.materials.new(name=mat_name)
+if not mat.use_nodes:
     mat.use_nodes = True
 
 nodes = mat.node_tree.nodes
@@ -269,8 +274,8 @@ def blender_clear_scene(keep_camera: bool = True, keep_lights: bool = True) -> s
         "keep_camera": keep_camera,
         "keep_lights": keep_lights
     })
-    if "error" in res and not res.get("success"):
-        return f"Error clearing scene: {res['error']}"
+    if res.get("error") or res.get("success") is False:
+        return f"Error clearing scene: {res.get('error', 'Unknown error')}"
     return f"🧹 Cleared scene successfully. Removed {res.get('deleted_count', 0)} objects."
 
 
@@ -294,8 +299,8 @@ def blender_render_image(
         "resolution_y": resolution_y
     }, timeout=60.0)
     
-    if "error" in res and not res.get("success"):
-        return f"Render failed: {res['error']}"
+    if res.get("error") or res.get("success") is False:
+        return f"Render failed: {res.get('error', 'Unknown error')}"
         
     return f"🖼️ Render completed successfully! Saved to: {res.get('filepath')}"
 
@@ -324,6 +329,7 @@ def blender_import_3d_model(
     scl = scale if scale is not None else [1.0, 1.0, 1.0]
 
     local_path = source_path_or_url.strip()
+    temp_download_path = None
     if local_path.startswith("http://") or local_path.startswith("https://"):
         try:
             parsed = urllib.parse.urlparse(local_path)
@@ -334,7 +340,8 @@ def blender_import_3d_model(
                 clean_filename = f"model{orig_ext}"
             temp_dir = tempfile.gettempdir()
             target_dest = os.path.join(temp_dir, f"mcp_model_{int(time.time())}_{clean_filename}")
-            
+            temp_download_path = target_dest
+
             resp = requests.get(local_path, stream=True, timeout=60.0)
             resp.raise_for_status()
             with open(target_dest, 'wb') as f:
@@ -342,21 +349,27 @@ def blender_import_3d_model(
                     f.write(chunk)
             local_path = target_dest
         except Exception as e:
+            if temp_download_path and os.path.exists(temp_download_path):
+                try:
+                    os.remove(temp_download_path)
+                except OSError:
+                    pass
             return f"❌ Failed to download 3D model from URL: {str(e)}"
 
-    local_path = os.path.abspath(local_path)
-    if not os.path.exists(local_path):
-        return f"❌ Model file not found at: {local_path}"
+    try:
+        local_path = os.path.abspath(local_path)
+        if not os.path.exists(local_path):
+            return f"❌ Model file not found at: {local_path}"
 
-    ext = pathlib.Path(local_path).suffix.lower()
-    filepath_repr = json.dumps(local_path)
-    ext_repr = json.dumps(ext)
-    name_repr = json.dumps(name)
-    loc_repr = json.dumps(loc)
-    rot_repr = json.dumps(rot)
-    scl_repr = json.dumps(scl)
+        ext = pathlib.Path(local_path).suffix.lower()
+        filepath_repr = json.dumps(local_path)
+        ext_repr = json.dumps(ext)
+        name_repr = json.dumps(name)
+        loc_repr = json.dumps(loc)
+        rot_repr = json.dumps(rot)
+        scl_repr = json.dumps(scl)
 
-    script = f"""import bpy
+        script = f"""import bpy
 import os
 
 filepath = {filepath_repr}
@@ -400,7 +413,13 @@ if imported_obj:
 else:
     print("Import finished, but no active object found.")
 """
-    return blender_execute_script(script)
+        return blender_execute_script(script)
+    finally:
+        if temp_download_path and os.path.exists(temp_download_path):
+            try:
+                os.remove(temp_download_path)
+            except OSError:
+                pass
 
 
 def main():

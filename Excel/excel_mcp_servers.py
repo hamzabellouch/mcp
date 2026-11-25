@@ -25,7 +25,16 @@ from typing import List, Dict, Any, Optional, Union, Tuple
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter, column_index_from_string
-from openpyxl.chart import BarChart, LineChart, PieChart, AreaChart, Reference
+from openpyxl.chart import (
+    BarChart,
+    LineChart,
+    PieChart,
+    AreaChart,
+    ScatterChart,
+    DoughnutChart,
+    Reference,
+    Series,
+)
 
 try:
     import win32com.client
@@ -95,15 +104,24 @@ TRANSIENT_HRESULTS = {-2147418111, -2147417846}
 
 def ensure_com() -> None:
     """Initialise desktop connection and COM once per thread (idempotent)."""
-    if sys.platform == "win32":
+    if sys.platform == "win32" and not getattr(_tls, "desktop_bound", False):
+        h_default = None
         try:
             import ctypes
             user32 = ctypes.windll.user32
             h_default = user32.OpenDesktopW("Default", 0, False, 0x01FF)
             if h_default:
                 user32.SetThreadDesktop(h_default)
+            _tls.desktop_bound = True
         except Exception:
             pass
+        finally:
+            if h_default:
+                try:
+                    import ctypes
+                    ctypes.windll.user32.CloseDesktop(h_default)
+                except Exception:
+                    pass
 
     if COM_AVAILABLE and not getattr(_tls, "initialised", False):
         try:
@@ -241,10 +259,8 @@ def hex_to_bgr_int(hex_str: str) -> int:
 
 def hex_to_argb_hex(hex_str: str) -> str:
     """Convert hex color to ARGB hex string 'FFRRGGBB' for openpyxl."""
-    hex_str = hex_str.strip().lstrip('#')
-    if len(hex_str) == 3:
-        hex_str = ''.join([c * 2 for c in hex_str])
-    return f"FF{hex_str.upper()}"
+    r, g, b = parse_hex_color(hex_str)
+    return f"FF{r:02X}{g:02X}{b:02X}"
 
 
 def split_sheet_and_range(range_str: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -253,9 +269,9 @@ def split_sheet_and_range(range_str: Optional[str]) -> Tuple[Optional[str], Opti
         return None, None
     if '!' in range_str:
         parts = range_str.split('!', 1)
-        sheet = parts[0].strip().strip("'\"")
-        rng = parts[1].strip()
-        return sheet, rng
+        sheet = parts[0].strip().strip("'\"").replace("''", "'")
+        rng = parts[1].strip() or None
+        return (sheet or None), rng
     return None, range_str.strip()
 
 
@@ -277,38 +293,84 @@ class LiveExcelSession:
     """Manages connection to active or spawned Excel COM instance."""
 
     @staticmethod
-    def get_app(create_if_missing: bool = False, visible: bool = True):
+    def _same_path(p1: str, p2: str) -> bool:
+        if "://" in p1 or "://" in p2:
+            return p1.lower() == p2.lower()
+        try:
+            return os.path.normcase(os.path.abspath(p1)) == os.path.normcase(os.path.abspath(p2))
+        except Exception:
+            return p1.lower() == p2.lower()
+
+    @staticmethod
+    def try_get_active_app():
+        """Return running Excel.Application if attached, None if not running, or raise ExcelNotReachable."""
         if not COM_AVAILABLE:
-            raise RuntimeError("pywin32 (win32com) is not available in this Python environment.")
+            return None
         ensure_com()
         try:
-            app = win32com.client.GetActiveObject("Excel.Application")
+            return com_retry(win32com.client.GetActiveObject, "Excel.Application")
+        except Exception as exc:
+            if excel_process_exists():
+                raise ExcelNotReachable(
+                    "EXCEL.EXE is running, but COM could not attach to it (e.g., modal dialog or elevation mismatch)."
+                ) from exc
+            return None
+
+    @staticmethod
+    def is_running() -> bool:
+        try:
+            return LiveExcelSession.try_get_active_app() is not None
+        except ExcelNotReachable:
+            return True
+
+    @staticmethod
+    def find_open_workbook(app, filepath: str):
+        """Find an already-open workbook matching full normalized filepath."""
+        for wb in app.Workbooks:
+            try:
+                full_name = getattr(wb, "FullName", "") or ""
+                if full_name and LiveExcelSession._same_path(full_name, filepath):
+                    return wb
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def get_app(create_if_missing: bool = False, visible: bool = True):
+        if not COM_AVAILABLE:
+            raise LiveExcelError("pywin32 (win32com) is not available in this Python environment.")
+        ensure_com()
+        try:
+            app = com_retry(win32com.client.GetActiveObject, "Excel.Application")
             if visible and not app.Visible:
                 app.Visible = True
             return app
-        except Exception:
+        except Exception as exc:
+            if excel_process_exists():
+                raise ExcelNotReachable(
+                    "EXCEL.EXE is running, but COM could not attach to it (modal dialog or privilege mismatch)."
+                ) from exc
             if create_if_missing:
-                app = win32com.client.Dispatch("Excel.Application")
+                app = com_retry(win32com.client.Dispatch, "Excel.Application")
                 app.Visible = visible
                 return app
-            raise RuntimeError("Microsoft Excel is not currently running. Please open Excel or specify a file path.")
+            raise ExcelNotRunning(
+                "Microsoft Excel is not currently running. Please open Excel or specify a file path."
+            ) from exc
 
     @staticmethod
     def get_workbook(app, filepath: Optional[str] = None):
         if filepath:
-            norm_path = os.path.abspath(filepath).lower()
-            for wb in app.Workbooks:
-                try:
-                    if wb.FullName.lower() == norm_path or wb.Name.lower() == os.path.basename(norm_path):
-                        return wb
-                except Exception:
-                    pass
-            # Not currently open, open it
-            return app.Workbooks.Open(os.path.abspath(filepath))
-        else:
-            if app.Workbooks.Count == 0:
-                return app.Workbooks.Add()
-            return app.ActiveWorkbook
+            wb = LiveExcelSession.find_open_workbook(app, filepath)
+            if wb is not None:
+                return wb
+            abs_path = os.path.abspath(filepath)
+            if not os.path.exists(abs_path):
+                raise FileNotFoundError(f"File not found: {abs_path}")
+            return com_retry(app.Workbooks.Open, abs_path)
+        if app.Workbooks.Count == 0 or app.ActiveWorkbook is None:
+            return app.Workbooks.Add()
+        return app.ActiveWorkbook
 
     @staticmethod
     def get_sheet(wb, sheet_name: Optional[str] = None):
@@ -317,6 +379,8 @@ class LiveExcelSession:
                 return wb.Sheets(sheet_name)
             except Exception:
                 raise ValueError(f"Sheet '{sheet_name}' not found in workbook '{wb.Name}'.")
+        if wb.ActiveSheet is None:
+            raise ValueError(f"Workbook '{wb.Name}' has no active worksheet.")
         return wb.ActiveSheet
 
 
@@ -327,11 +391,90 @@ class LiveExcelSession:
 class ExcelEngine:
     """Unified engine supporting Live COM Excel and Offline openpyxl."""
 
+    @staticmethod
+    def _resolve_live_target(
+        filepath: Optional[str] = None,
+        visible: bool = True,
+    ) -> Tuple[Optional[Any], Optional[Any], bool]:
+        """
+        Resolve (app, wb, opened_in_live_mode) according to EXCEL_MCP_MODE and filepath.
+        Returns (None, None, False) when openpyxl should handle the file directly.
+        """
+        mode = get_mode()
+        if mode == "headless":
+            if not filepath:
+                raise ValueError("Filepath is required when EXCEL_MCP_MODE='headless'.")
+            return None, None, False
+
+        if not COM_AVAILABLE:
+            if mode == "live" or not filepath:
+                raise LiveExcelError("pywin32 (win32com) is not available in this Python environment.")
+            return None, None, False
+
+        if not filepath:
+            app = LiveExcelSession.get_app(create_if_missing=False, visible=visible)
+            if app.Workbooks.Count == 0 or app.ActiveWorkbook is None:
+                raise ExcelNotRunning("Microsoft Excel is running, but no workbook is open.")
+            return app, app.ActiveWorkbook, False
+
+        app = LiveExcelSession.try_get_active_app()
+        if app is not None:
+            open_wb = LiveExcelSession.find_open_workbook(app, filepath)
+            if open_wb is not None:
+                if visible and not getattr(app, "Visible", True):
+                    app.Visible = True
+                return app, open_wb, False
+
+        if mode == "live":
+            app = app or LiveExcelSession.get_app(create_if_missing=True, visible=visible)
+            wb = LiveExcelSession.get_workbook(app, filepath)
+            return app, wb, True
+
+        return None, None, False
+
+    @staticmethod
+    def _get_openpyxl_sheet(wb: openpyxl.Workbook, sheet_name: Optional[str] = None):
+        if sheet_name:
+            if sheet_name not in wb.sheetnames:
+                raise ValueError(f"Sheet '{sheet_name}' not found in workbook.")
+            return wb[sheet_name]
+        if wb.active is None:
+            raise ValueError("Workbook has no active worksheet.")
+        return wb.active
+
+    @staticmethod
+    def _autofit_openpyxl_columns(ws) -> None:
+        for col in ws.columns:
+            max_len = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col)
+            col_letter = get_column_letter(col[0].column)
+            ws.column_dimensions[col_letter].width = max(max_len + 3, 10)
+
+    @staticmethod
+    def _finalize_live_wb(app, wb, opened_in_live_mode: bool, save_changes: bool = False) -> None:
+        if not opened_in_live_mode or wb is None:
+            return
+        prev_alerts = getattr(app, "DisplayAlerts", None)
+        try:
+            if prev_alerts is not None:
+                app.DisplayAlerts = False
+            wb.Close(SaveChanges=bool(save_changes))
+        except Exception:
+            pass
+        finally:
+            if prev_alerts is not None:
+                try:
+                    app.DisplayAlerts = prev_alerts
+                except Exception:
+                    pass
+
     @classmethod
     def get_status(cls) -> Dict[str, Any]:
         """Check Excel runtime status and open workbooks."""
+        mode = get_mode()
         status_info = {
+            "mode": mode,
             "excel_running": False,
+            "excel_reachable": False,
             "com_available": COM_AVAILABLE,
             "version": None,
             "open_workbooks": [],
@@ -339,33 +482,38 @@ class ExcelEngine:
             "active_sheet": None
         }
 
-        if COM_AVAILABLE:
+        if COM_AVAILABLE and mode != "headless":
             try:
-                ensure_com()
-                app = win32com.client.GetActiveObject("Excel.Application")
+                app = LiveExcelSession.try_get_active_app()
+                if app is not None:
+                    status_info["excel_running"] = True
+                    status_info["excel_reachable"] = True
+                    status_info["version"] = getattr(app, "Version", "Unknown")
+
+                    wb_count = app.Workbooks.Count
+                    workbooks = []
+                    for i in range(1, wb_count + 1):
+                        try:
+                            wb = app.Workbooks(i)
+                            sheets = [s.Name for s in wb.Sheets]
+                            workbooks.append({
+                                "name": wb.Name,
+                                "path": wb.FullName,
+                                "saved": wb.Saved,
+                                "sheets": sheets
+                            })
+                        except Exception:
+                            pass
+                    status_info["open_workbooks"] = workbooks
+
+                    if app.ActiveWorkbook:
+                        status_info["active_workbook"] = app.ActiveWorkbook.Name
+                    if app.ActiveSheet:
+                        status_info["active_sheet"] = app.ActiveSheet.Name
+            except ExcelNotReachable as exc:
                 status_info["excel_running"] = True
-                status_info["version"] = getattr(app, "Version", "Unknown")
-                
-                wb_count = app.Workbooks.Count
-                workbooks = []
-                for i in range(1, wb_count + 1):
-                    try:
-                        wb = app.Workbooks(i)
-                        sheets = [s.Name for s in wb.Sheets]
-                        workbooks.append({
-                            "name": wb.Name,
-                            "path": wb.FullName,
-                            "saved": wb.Saved,
-                            "sheets": sheets
-                        })
-                    except Exception:
-                        pass
-                status_info["open_workbooks"] = workbooks
-                
-                if app.ActiveWorkbook:
-                    status_info["active_workbook"] = app.ActiveWorkbook.Name
-                if app.ActiveSheet:
-                    status_info["active_sheet"] = app.ActiveSheet.Name
+                status_info["excel_reachable"] = False
+                status_info["error"] = str(exc)
             except Exception:
                 pass
 
@@ -382,11 +530,26 @@ class ExcelEngine:
         table_style: Optional[str] = None
     ) -> Dict[str, Any]:
         """Create a new Excel workbook with optional initial data & styling."""
-        
-        # If COM is available and either no filepath is given or user wants it visible in Excel:
-        if COM_AVAILABLE and (filepath is None or visible):
+        mode = get_mode()
+        if mode == "headless" and not filepath:
+            raise ValueError("Filepath is required when EXCEL_MCP_MODE='headless'.")
+
+        abs_target = os.path.abspath(filepath) if filepath else None
+        if COM_AVAILABLE and mode != "headless":
+            active_app = LiveExcelSession.try_get_active_app()
+            if active_app is not None and abs_target:
+                if LiveExcelSession.find_open_workbook(active_app, abs_target) is not None:
+                    raise LiveExcelError(
+                        f"Workbook '{abs_target}' is already open in Microsoft Excel. "
+                        "Close it or modify it via write_range/clear_range instead of overwriting on disk."
+                    )
+
+        # Use COM when headless is not active and either no filepath is given, live mode is enforced, or visible is True
+        if COM_AVAILABLE and mode != "headless" and (filepath is None or visible or mode == "live"):
+            app = None
+            wb = None
+            was_running = LiveExcelSession.is_running()
             try:
-                ensure_com()
                 app = LiveExcelSession.get_app(create_if_missing=True, visible=visible)
                 wb = app.Workbooks.Add()
                 ws = wb.ActiveSheet
@@ -395,14 +558,14 @@ class ExcelEngine:
                         ws.Name = sheet_name
                     except Exception:
                         pass
-                
+
                 row_idx = 1
                 if headers:
                     for col_idx, h in enumerate(headers, 1):
                         ws.Cells(row_idx, col_idx).Value = h
                         ws.Cells(row_idx, col_idx).Font.Bold = True
                     row_idx += 1
-                
+
                 if data:
                     for r in data:
                         for col_idx, val in enumerate(r, 1):
@@ -411,7 +574,7 @@ class ExcelEngine:
                             else:
                                 ws.Cells(row_idx, col_idx).Value = val
                         row_idx += 1
-                
+
                 if table_style and headers and data:
                     try:
                         end_col = len(headers)
@@ -425,14 +588,23 @@ class ExcelEngine:
 
                 # Auto-fit columns
                 ws.Columns.AutoFit()
-                
+
                 saved_path = None
-                if filepath:
-                    abs_path = os.path.abspath(filepath)
-                    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-                    wb.SaveAs(abs_path)
-                    saved_path = abs_path
-                
+                if abs_target:
+                    os.makedirs(os.path.dirname(abs_target), exist_ok=True)
+                    prev_alerts = getattr(app, "DisplayAlerts", None)
+                    try:
+                        if prev_alerts is not None:
+                            app.DisplayAlerts = False
+                        wb.SaveAs(abs_target)
+                    finally:
+                        if prev_alerts is not None:
+                            try:
+                                app.DisplayAlerts = prev_alerts
+                            except Exception:
+                                pass
+                    saved_path = abs_target
+
                 return {
                     "success": True,
                     "message": f"Workbook created successfully in live Excel (Sheet: '{ws.Name}')" + (f", saved to {saved_path}" if saved_path else " (unsaved in Excel)."),
@@ -441,65 +613,71 @@ class ExcelEngine:
                     "filepath": saved_path
                 }
             except Exception as e:
-                # If COM fails, fall back to openpyxl if filepath provided
-                if not filepath:
+                if wb is not None:
+                    cls._finalize_live_wb(app, wb, True, save_changes=False)
+                if not was_running and app is not None and not filepath:
+                    try:
+                        app.Quit()
+                    except Exception:
+                        pass
+                if not filepath or mode == "live":
                     raise e
 
         # Fallback / Headless creation via openpyxl
         wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = sheet_name or "Sheet1"
-        
-        row_idx = 1
-        if headers:
-            for col_idx, h in enumerate(headers, 1):
-                cell = ws.cell(row=row_idx, column=col_idx, value=h)
-                cell.font = Font(bold=True)
-            row_idx += 1
-        
-        if data:
-            for r in data:
-                for col_idx, val in enumerate(r, 1):
-                    ws.cell(row=row_idx, column=col_idx, value=val)
-                row_idx += 1
-        
-        # Apply Table Style if specified
-        if table_style and headers and data:
-            try:
-                from openpyxl.worksheet.table import Table, TableStyleInfo
-                end_col = len(headers)
-                end_row = len(data) + 1
-                end_col_letter = get_column_letter(end_col)
-                tab_range = f"A1:{end_col_letter}{end_row}"
-                tab = Table(displayName="Table1", ref=tab_range)
-                style_name = table_style if table_style.startswith("TableStyle") else f"TableStyle{table_style}"
-                tab.tableStyleInfo = TableStyleInfo(
-                    name=style_name,
-                    showFirstColumn=False,
-                    showLastColumn=False,
-                    showRowStripes=True,
-                    showColumnStripes=True
-                )
-                ws.add_table(tab)
-            except Exception:
-                pass
+        try:
+            ws = wb.active
+            ws.title = sheet_name or "Sheet1"
 
-        # Auto-adjust column widths
-        for col in ws.columns:
-            max_len = max(len(str(cell.value or '')) for cell in col)
-            col_letter = get_column_letter(col[0].column)
-            ws.column_dimensions[col_letter].width = max(max_len + 3, 10)
-            
-        target_path = os.path.abspath(filepath or "workbook.xlsx")
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        wb.save(target_path)
-        
-        return {
-            "success": True,
-            "message": f"Workbook created and saved via openpyxl to {target_path}",
-            "filepath": target_path,
-            "sheet_name": ws.title
-        }
+            row_idx = 1
+            if headers:
+                for col_idx, h in enumerate(headers, 1):
+                    cell = ws.cell(row=row_idx, column=col_idx, value=h)
+                    cell.font = Font(bold=True)
+                row_idx += 1
+
+            if data:
+                for r in data:
+                    for col_idx, val in enumerate(r, 1):
+                        ws.cell(row=row_idx, column=col_idx, value=val)
+                    row_idx += 1
+
+            # Apply Table Style if specified
+            if table_style and headers and data:
+                try:
+                    from openpyxl.worksheet.table import Table, TableStyleInfo
+                    end_col = len(headers)
+                    end_row = len(data) + 1
+                    end_col_letter = get_column_letter(end_col)
+                    tab_range = f"A1:{end_col_letter}{end_row}"
+                    tab = Table(displayName="Table1", ref=tab_range)
+                    style_name = table_style if table_style.startswith("TableStyle") else f"TableStyle{table_style}"
+                    tab.tableStyleInfo = TableStyleInfo(
+                        name=style_name,
+                        showFirstColumn=False,
+                        showLastColumn=False,
+                        showRowStripes=True,
+                        showColumnStripes=True
+                    )
+                    ws.add_table(tab)
+                except Exception:
+                    pass
+
+            # Auto-adjust column widths
+            cls._autofit_openpyxl_columns(ws)
+
+            target_path = os.path.abspath(filepath or "workbook.xlsx")
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            wb.save(target_path)
+
+            return {
+                "success": True,
+                "message": f"Workbook created and saved via openpyxl to {target_path}",
+                "filepath": target_path,
+                "sheet_name": ws.title
+            }
+        finally:
+            wb.close()
 
     @classmethod
     def open_workbook(cls, filepath: str, read_only: bool = False, visible: bool = True) -> Dict[str, Any]:
@@ -508,11 +686,12 @@ class ExcelEngine:
         if not os.path.exists(abs_path):
             raise FileNotFoundError(f"File not found: {abs_path}")
 
-        if COM_AVAILABLE:
+        mode = get_mode()
+        if COM_AVAILABLE and mode != "headless":
             try:
-                ensure_com()
                 app = LiveExcelSession.get_app(create_if_missing=True, visible=visible)
-                wb = app.Workbooks.Open(abs_path, ReadOnly=read_only)
+                existing_wb = LiveExcelSession.find_open_workbook(app, abs_path)
+                wb = existing_wb if existing_wb is not None else com_retry(app.Workbooks.Open, abs_path, ReadOnly=read_only)
                 sheets = [s.Name for s in wb.Sheets]
                 return {
                     "success": True,
@@ -523,16 +702,27 @@ class ExcelEngine:
                     "active_sheet": wb.ActiveSheet.Name
                 }
             except Exception as e:
-                pass
-        
+                if mode == "live":
+                    raise e
+
         wb = openpyxl.load_workbook(abs_path, read_only=read_only)
-        return {
-            "success": True,
-            "message": f"Loaded '{os.path.basename(abs_path)}' via openpyxl.",
-            "filepath": abs_path,
-            "sheets": wb.sheetnames,
-            "active_sheet": wb.active.title if wb.active else None
-        }
+        try:
+            sheets = list(wb.sheetnames)
+            active_title = sheets[0] if sheets else None
+            try:
+                if wb.active is not None:
+                    active_title = wb.active.title
+            except Exception:
+                pass
+            return {
+                "success": True,
+                "message": f"Loaded '{os.path.basename(abs_path)}' via openpyxl.",
+                "filepath": abs_path,
+                "sheets": sheets,
+                "active_sheet": active_title
+            }
+        finally:
+            wb.close()
 
     @classmethod
     def read_range(
@@ -544,35 +734,28 @@ class ExcelEngine:
         output_format: str = "json"
     ) -> Dict[str, Any]:
         """Read data/formulas from an Excel range or sheet."""
-        
-        # Check if sheet is embedded in range_address
         parsed_sheet, parsed_rng = split_sheet_and_range(range_address)
         sheet_name = parsed_sheet or sheet_name
         range_address = parsed_rng
 
-        # Try Live COM if no filepath is given or Excel has the file open
-        if COM_AVAILABLE and not filepath:
+        app, wb, opened_in_live = cls._resolve_live_target(filepath=filepath, visible=True)
+        if wb is not None:
             try:
-                ensure_com()
-                app = LiveExcelSession.get_app(create_if_missing=False)
-                wb = LiveExcelSession.get_workbook(app, filepath)
                 ws = LiveExcelSession.get_sheet(wb, sheet_name)
-                
-                if range_address:
-                    rng = ws.Range(range_address)
-                else:
-                    rng = ws.UsedRange
-                
+                rng = ws.Range(range_address) if range_address else ws.UsedRange
                 raw_values = rng.Formula if include_formulas else rng.Value
-                
-                # Normalize values to 2D list
-                if not isinstance(raw_values, (tuple, list)):
-                    values_matrix = [[raw_values]]
-                elif len(raw_values) > 0 and not isinstance(raw_values[0], (tuple, list)):
-                    values_matrix = [[v for v in raw_values]]
+
+                if raw_values is None:
+                    values_matrix = []
+                elif not isinstance(raw_values, (tuple, list)):
+                    values_matrix = [[sanitize_value(raw_values)]]
+                elif len(raw_values) == 0:
+                    values_matrix = []
+                elif not isinstance(raw_values[0], (tuple, list)):
+                    values_matrix = [[sanitize_value(v) for v in raw_values]]
                 else:
                     values_matrix = [[sanitize_value(cell) for cell in row] for row in raw_values]
-                
+
                 result = {
                     "workbook": wb.Name,
                     "sheet": ws.Name,
@@ -581,58 +764,76 @@ class ExcelEngine:
                     "col_count": len(values_matrix[0]) if values_matrix else 0,
                     "data": values_matrix
                 }
-                
+
                 if output_format == "markdown_table":
                     result["markdown"] = cls._to_markdown_table(values_matrix)
-                elif output_format == "records" and len(values_matrix) > 1:
-                    headers = [str(h or f"col_{i+1}") for i, h in enumerate(values_matrix[0])]
+                elif output_format == "records":
+                    if len(values_matrix) > 1:
+                        headers = [str(h) if h not in (None, "") else f"col_{i+1}" for i, h in enumerate(values_matrix[0])]
+                        result["records"] = [
+                            dict(zip(headers, row)) for row in values_matrix[1:]
+                        ]
+                    else:
+                        result["records"] = []
+                return result
+            finally:
+                cls._finalize_live_wb(app, wb, opened_in_live, save_changes=False)
+
+        if not filepath:
+            raise ValueError("Filepath is required when Excel is not running.")
+
+        abs_path = os.path.abspath(filepath)
+        if not os.path.exists(abs_path):
+            raise FileNotFoundError(f"File not found: {abs_path}")
+
+        wb = openpyxl.load_workbook(abs_path, data_only=not include_formulas)
+        try:
+            ws = cls._get_openpyxl_sheet(wb, sheet_name)
+
+            if range_address:
+                cells = ws[range_address]
+                if not isinstance(cells, tuple):
+                    values_matrix = [[sanitize_value(cells.value)]]
+                elif len(cells) == 0:
+                    values_matrix = []
+                elif not isinstance(cells[0], tuple):
+                    if len(cells) > 1 and getattr(cells[0], "column", None) == getattr(cells[1], "column", None):
+                        values_matrix = [[sanitize_value(c.value)] for c in cells]
+                    else:
+                        values_matrix = [[sanitize_value(c.value) for c in cells]]
+                else:
+                    values_matrix = [[sanitize_value(c.value) for c in row] for row in cells]
+            else:
+                values_matrix = [
+                    [sanitize_value(v) for v in row]
+                    for row in ws.iter_rows(values_only=True)
+                ]
+
+            safe_max_col = max(int(ws.max_column or 1), 1)
+            safe_max_row = max(int(ws.max_row or 1), 1)
+            result = {
+                "filepath": abs_path,
+                "sheet": ws.title,
+                "range": range_address or f"A1:{get_column_letter(safe_max_col)}{safe_max_row}",
+                "row_count": len(values_matrix),
+                "col_count": len(values_matrix[0]) if values_matrix else 0,
+                "data": values_matrix
+            }
+
+            if output_format == "markdown_table":
+                result["markdown"] = cls._to_markdown_table(values_matrix)
+            elif output_format == "records":
+                if len(values_matrix) > 1:
+                    headers = [str(h) if h not in (None, "") else f"col_{i+1}" for i, h in enumerate(values_matrix[0])]
                     result["records"] = [
                         dict(zip(headers, row)) for row in values_matrix[1:]
                     ]
-                return result
-            except Exception as e:
-                if not filepath:
-                    raise e
+                else:
+                    result["records"] = []
 
-        # Offline / file-based reading using openpyxl
-        if not filepath:
-            raise ValueError("Filepath is required when Excel is not running.")
-        
-        abs_path = os.path.abspath(filepath)
-        wb = openpyxl.load_workbook(abs_path, data_only=not include_formulas)
-        ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
-        
-        if range_address:
-            cells = ws[range_address]
-            if not isinstance(cells, tuple):
-                values_matrix = [[cells.value]]
-            elif len(cells) > 0 and not isinstance(cells[0], tuple):
-                values_matrix = [[c.value for c in cells]]
-            else:
-                values_matrix = [[sanitize_value(c.value) for c in row] for row in cells]
-        else:
-            values_matrix = []
-            for row in ws.iter_rows(values_only=True):
-                values_matrix.append([sanitize_value(v) for v in row])
-        
-        result = {
-            "filepath": abs_path,
-            "sheet": ws.title,
-            "range": range_address or f"A1:{get_column_letter(ws.max_column)}{ws.max_row}",
-            "row_count": len(values_matrix),
-            "col_count": len(values_matrix[0]) if values_matrix else 0,
-            "data": values_matrix
-        }
-        
-        if output_format == "markdown_table":
-            result["markdown"] = cls._to_markdown_table(values_matrix)
-        elif output_format == "records" and len(values_matrix) > 1:
-            headers = [str(h or f"col_{i+1}") for i, h in enumerate(values_matrix[0])]
-            result["records"] = [
-                dict(zip(headers, row)) for row in values_matrix[1:]
-            ]
-            
-        return result
+            return result
+        finally:
+            wb.close()
 
     @classmethod
     def write_range(
@@ -646,26 +847,24 @@ class ExcelEngine:
         """Write 2D list of values or formulas into a sheet."""
         if not data:
             return {"success": False, "message": "No data provided to write."}
-        
+
         parsed_sheet, parsed_start = split_sheet_and_range(start_cell)
         sheet_name = parsed_sheet or sheet_name
         start_cell = parsed_start or "A1"
 
-        # Try Live COM
-        if COM_AVAILABLE and not filepath:
+        rows_written = len(data)
+        cols_written = max((len(r) for r in data), default=0)
+        if cols_written == 0:
+            return {"success": False, "message": "No non-empty rows provided to write."}
+
+        app, wb, opened_in_live = cls._resolve_live_target(filepath=filepath, visible=True)
+        if wb is not None:
             try:
-                ensure_com()
-                app = LiveExcelSession.get_app(create_if_missing=False)
-                wb = LiveExcelSession.get_workbook(app, filepath)
                 ws = LiveExcelSession.get_sheet(wb, sheet_name)
-                
                 start_rng = ws.Range(start_cell)
                 start_row = start_rng.Row
                 start_col = start_rng.Column
-                
-                rows_written = len(data)
-                cols_written = max(len(r) for r in data) if data else 0
-                
+
                 for r_idx, row_data in enumerate(data):
                     for c_idx, val in enumerate(row_data):
                         cell = ws.Cells(start_row + r_idx, start_col + c_idx)
@@ -673,12 +872,12 @@ class ExcelEngine:
                             cell.Formula = val
                         else:
                             cell.Value = val
-                
-                if auto_fit_columns:
+
+                if auto_fit_columns and cols_written > 0:
                     end_col = start_col + cols_written - 1
                     ws.Range(ws.Cells(1, start_col), ws.Cells(1, end_col)).EntireColumn.AutoFit()
-                
-                return {
+
+                res = {
                     "success": True,
                     "message": f"Successfully wrote {rows_written}x{cols_written} cells to {ws.Name}!{start_cell}",
                     "workbook": wb.Name,
@@ -686,45 +885,45 @@ class ExcelEngine:
                     "rows_written": rows_written,
                     "cols_written": cols_written
                 }
-            except Exception as e:
-                if not filepath:
-                    raise e
+                if opened_in_live:
+                    cls._finalize_live_wb(app, wb, True, save_changes=True)
+                return res
+            except Exception:
+                cls._finalize_live_wb(app, wb, opened_in_live, save_changes=False)
+                raise
 
-        # File-based via openpyxl
         if not filepath:
             raise ValueError("Filepath required when Excel application is not running.")
-            
+
         abs_path = os.path.abspath(filepath)
+        if not os.path.exists(abs_path):
+            raise FileNotFoundError(f"File not found: {abs_path}")
+
         wb = openpyxl.load_workbook(abs_path)
-        ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
-        
-        # Calculate start row and col
-        start_cell_obj = ws[start_cell]
-        start_row = start_cell_obj.row
-        start_col = start_cell_obj.column
-        
-        rows_written = len(data)
-        cols_written = max(len(r) for r in data) if data else 0
-        
-        for r_idx, row_data in enumerate(data):
-            for c_idx, val in enumerate(row_data):
-                ws.cell(row=start_row + r_idx, column=start_col + c_idx, value=val)
-        
-        if auto_fit_columns:
-            for col in ws.columns:
-                max_len = max(len(str(cell.value or '')) for cell in col)
-                col_letter = get_column_letter(col[0].column)
-                ws.column_dimensions[col_letter].width = max(max_len + 3, 10)
-                
-        wb.save(abs_path)
-        return {
-            "success": True,
-            "message": f"Saved {rows_written}x{cols_written} cells to '{abs_path}' (Sheet: '{ws.title}') starting at {start_cell}",
-            "filepath": abs_path,
-            "sheet": ws.title,
-            "rows_written": rows_written,
-            "cols_written": cols_written
-        }
+        try:
+            ws = cls._get_openpyxl_sheet(wb, sheet_name)
+            start_cell_obj = ws[start_cell]
+            start_row = start_cell_obj.row
+            start_col = start_cell_obj.column
+
+            for r_idx, row_data in enumerate(data):
+                for c_idx, val in enumerate(row_data):
+                    ws.cell(row=start_row + r_idx, column=start_col + c_idx, value=val)
+
+            if auto_fit_columns:
+                cls._autofit_openpyxl_columns(ws)
+
+            wb.save(abs_path)
+            return {
+                "success": True,
+                "message": f"Saved {rows_written}x{cols_written} cells to '{abs_path}' (Sheet: '{ws.title}') starting at {start_cell}",
+                "filepath": abs_path,
+                "sheet": ws.title,
+                "rows_written": rows_written,
+                "cols_written": cols_written
+            }
+        finally:
+            wb.close()
 
     @classmethod
     def format_range(
@@ -748,15 +947,15 @@ class ExcelEngine:
         sheet_name = parsed_sheet or sheet_name
         range_address = parsed_rng or "A1"
 
-        # Try Live COM
-        if COM_AVAILABLE and not filepath:
+        if horizontal_align is not None and horizontal_align.lower() not in ("left", "center", "right", "justify", "general"):
+            raise ValueError(f"Unsupported horizontal_align: '{horizontal_align}'")
+
+        app, wb, opened_in_live = cls._resolve_live_target(filepath=filepath, visible=True)
+        if wb is not None:
             try:
-                ensure_com()
-                app = LiveExcelSession.get_app(create_if_missing=False)
-                wb = LiveExcelSession.get_workbook(app, filepath)
                 ws = LiveExcelSession.get_sheet(wb, sheet_name)
                 rng = ws.Range(range_address)
-                
+
                 if bold is not None:
                     rng.Font.Bold = bold
                 if italic is not None:
@@ -772,10 +971,9 @@ class ExcelEngine:
                 if number_format is not None:
                     rng.NumberFormat = number_format
                 if horizontal_align is not None:
-                    align_map = {"left": -4131, "center": -4108, "right": -4152}
-                    if horizontal_align.lower() in align_map:
-                        rng.HorizontalAlignment = align_map[horizontal_align.lower()]
-                
+                    align_map = {"left": -4131, "center": -4108, "right": -4152, "justify": -4130, "general": 1}
+                    rng.HorizontalAlignment = align_map[horizontal_align.lower()]
+
                 if border is not None:
                     if border in ("all_thin", "all"):
                         for border_id in [7, 8, 9, 10, 11, 12]:  # Left, Top, Bottom, Right, InsideH, InsideV
@@ -790,88 +988,107 @@ class ExcelEngine:
                         rng.Borders(9).LineStyle = -4119  # xlDouble
                     elif border == "none":
                         rng.Borders.LineStyle = 0
-                        
+
                 if auto_fit:
                     rng.EntireColumn.AutoFit()
-                    
-                return {
+
+                res = {
                     "success": True,
                     "message": f"Formatted range {range_address} in live Excel ({ws.Name})",
                     "sheet": ws.Name,
                     "range": range_address
                 }
-            except Exception as e:
-                if not filepath:
-                    raise e
+                if opened_in_live:
+                    cls._finalize_live_wb(app, wb, True, save_changes=True)
+                return res
+            except Exception:
+                cls._finalize_live_wb(app, wb, opened_in_live, save_changes=False)
+                raise
 
-        # File-based via openpyxl
         if not filepath:
             raise ValueError("Filepath required when Excel application is not running.")
-            
+
         abs_path = os.path.abspath(filepath)
+        if not os.path.exists(abs_path):
+            raise FileNotFoundError(f"File not found: {abs_path}")
+
         wb = openpyxl.load_workbook(abs_path)
-        ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
-        
-        cells = ws[range_address]
-        if not isinstance(cells, tuple):
-            cells_list = [cells]
-        elif len(cells) > 0 and not isinstance(cells[0], tuple):
-            cells_list = list(cells)
-        else:
-            cells_list = [c for row in cells for c in row]
-            
-        for cell in cells_list:
-            # Font
-            current_font = cell.font or Font()
-            new_font_kwargs = {
-                "name": font_name if font_name else current_font.name,
-                "size": font_size if font_size else current_font.size,
-                "bold": bold if bold is not None else current_font.bold,
-                "italic": italic if italic is not None else current_font.italic,
+        try:
+            ws = cls._get_openpyxl_sheet(wb, sheet_name)
+
+            cells = ws[range_address]
+            if not isinstance(cells, tuple):
+                cells_list = [cells]
+            elif len(cells) > 0 and not isinstance(cells[0], tuple):
+                cells_list = list(cells)
+            else:
+                cells_list = [c for row in cells for c in row]
+
+            min_row = min((c.row for c in cells_list), default=1)
+            max_row = max((c.row for c in cells_list), default=1)
+            min_col = min((c.column for c in cells_list), default=1)
+            max_col = max((c.column for c in cells_list), default=1)
+
+            for cell in cells_list:
+                current_font = cell.font or Font()
+                new_font_kwargs = {
+                    "name": font_name if font_name else current_font.name,
+                    "size": font_size if font_size else current_font.size,
+                    "bold": bold if bold is not None else current_font.bold,
+                    "italic": italic if italic is not None else current_font.italic,
+                    "color": hex_to_argb_hex(font_color) if font_color else current_font.color,
+                    "underline": current_font.underline,
+                    "strike": current_font.strike,
+                }
+                cell.font = Font(**new_font_kwargs)
+
+                if bg_color:
+                    argb = hex_to_argb_hex(bg_color)
+                    cell.fill = PatternFill(start_color=argb, end_color=argb, fill_type="solid")
+
+                if horizontal_align:
+                    curr_align = cell.alignment or Alignment()
+                    cell.alignment = Alignment(
+                        horizontal=horizontal_align.lower(),
+                        vertical=curr_align.vertical or "center",
+                        wrap_text=curr_align.wrap_text
+                    )
+
+                if number_format:
+                    cell.number_format = number_format
+
+                if border in ("all_thin", "all"):
+                    thin_side = Side(border_style="thin", color="000000")
+                    cell.border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+                elif border == "bottom_double":
+                    curr_b = cell.border or Border()
+                    double_side = Side(border_style="double", color="000000")
+                    cell.border = Border(left=curr_b.left, right=curr_b.right, top=curr_b.top, bottom=double_side)
+                elif border == "outline_thick":
+                    curr_b = cell.border or Border()
+                    thick_side = Side(border_style="thick", color="000000")
+                    cell.border = Border(
+                        left=thick_side if cell.column == min_col else curr_b.left,
+                        right=thick_side if cell.column == max_col else curr_b.right,
+                        top=thick_side if cell.row == min_row else curr_b.top,
+                        bottom=thick_side if cell.row == max_row else curr_b.bottom,
+                    )
+                elif border == "none":
+                    cell.border = Border()
+
+            if auto_fit:
+                cls._autofit_openpyxl_columns(ws)
+
+            wb.save(abs_path)
+            return {
+                "success": True,
+                "message": f"Formatted range {range_address} in '{abs_path}' (Sheet: '{ws.title}')",
+                "filepath": abs_path,
+                "sheet": ws.title,
+                "range": range_address
             }
-            if font_color:
-                new_font_kwargs["color"] = hex_to_argb_hex(font_color)
-            cell.font = Font(**new_font_kwargs)
-            
-            # Fill
-            if bg_color:
-                cell.fill = PatternFill(start_color=hex_to_argb_hex(bg_color), end_color=hex_to_argb_hex(bg_color), fill_type="solid")
-                
-            # Alignment
-            if horizontal_align:
-                curr_align = cell.alignment or Alignment()
-                cell.alignment = Alignment(
-                    horizontal=horizontal_align,
-                    vertical=curr_align.vertical or "center",
-                    wrap_text=curr_align.wrap_text
-                )
-                
-            # Number format
-            if number_format:
-                cell.number_format = number_format
-                
-            # Border
-            if border in ("all_thin", "all"):
-                thin_side = Side(border_style="thin", color="000000")
-                cell.border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
-            elif border == "bottom_double":
-                double_side = Side(border_style="double", color="000000")
-                cell.border = Border(bottom=double_side)
-                
-        if auto_fit:
-            for col in ws.columns:
-                max_len = max(len(str(c.value or '')) for c in col)
-                col_letter = get_column_letter(col[0].column)
-                ws.column_dimensions[col_letter].width = max(max_len + 3, 10)
-                
-        wb.save(abs_path)
-        return {
-            "success": True,
-            "message": f"Formatted range {range_address} in '{abs_path}' (Sheet: '{ws.title}')",
-            "filepath": abs_path,
-            "sheet": ws.title,
-            "range": range_address
-        }
+        finally:
+            wb.close()
 
     @classmethod
     def clear_range(
@@ -881,30 +1098,23 @@ class ExcelEngine:
         sheet_name: Optional[str] = None,
         clear_type: str = "all"
     ) -> Dict[str, Any]:
-        """
-        Clear contents, formatting, or all from a specific range or entire worksheet.
-        
-        Args:
-            range_address: Optional range to clear (e.g. 'A1:C10'). If omitted, clears entire worksheet.
-            filepath: Optional file path. If omitted, targets active workbook in live Excel.
-            sheet_name: Optional sheet name. Defaults to active sheet.
-            clear_type: 'all' (contents + styling), 'contents' (data only), 'formats' (styling only).
-        """
-        if COM_AVAILABLE:
+        """Clear contents, formatting, or all from a specific range or entire worksheet."""
+        parsed_sheet, parsed_rng = split_sheet_and_range(range_address)
+        sheet_name = parsed_sheet or sheet_name
+        range_address = parsed_rng
+        ct = clear_type.lower()
+
+        app, wb, opened_in_live = cls._resolve_live_target(filepath=filepath, visible=True)
+        if wb is not None:
             try:
-                ensure_com()
-                app = win32com.client.GetActiveObject("Excel.Application")
-                wb = LiveExcelSession.get_workbook(app, filepath)
                 ws = LiveExcelSession.get_sheet(wb, sheet_name)
-                
                 if range_address:
                     target = ws.Range(range_address)
                     target_desc = f"range {range_address}"
                 else:
                     target = ws.Cells
                     target_desc = f"entire sheet '{ws.Name}'"
-                    
-                ct = clear_type.lower()
+
                 if ct == "contents":
                     target.ClearContents()
                 elif ct == "formats":
@@ -913,62 +1123,62 @@ class ExcelEngine:
                     target.Clear()
                     if not range_address:
                         ws.Columns.ColumnWidth = 10.0
-                        
-                return {
+
+                res = {
                     "success": True,
                     "message": f"Successfully cleared {target_desc} ({ct}) in live Excel",
                     "workbook": wb.Name,
                     "sheet": ws.Name,
                     "range": range_address or "ALL"
                 }
-            except Exception as com_err:
-                if not filepath:
-                    raise com_err
+                if opened_in_live:
+                    cls._finalize_live_wb(app, wb, True, save_changes=True)
+                return res
+            except Exception:
+                cls._finalize_live_wb(app, wb, opened_in_live, save_changes=False)
+                raise
 
         if not filepath:
-            raise RuntimeError("Excel is not running and no filepath was provided.")
-            
+            raise ExcelNotRunning("Excel is not running and no filepath was provided.")
+
         abs_path = os.path.abspath(filepath)
         if not os.path.exists(abs_path):
             raise FileNotFoundError(f"File not found: {abs_path}")
-            
+
         wb = openpyxl.load_workbook(abs_path)
-        if sheet_name:
-            if sheet_name not in wb.sheetnames:
-                raise ValueError(f"Sheet '{sheet_name}' not found.")
-            ws = wb[sheet_name]
-        else:
-            ws = wb.active
-            
-        ct = clear_type.lower()
-        if range_address:
-            cells = ws[range_address]
-            if not isinstance(cells, tuple):
-                cells = ((cells,),)
-            elif not isinstance(cells[0], tuple):
-                cells = (cells,)
-        else:
-            cells = ws.iter_rows()
-            
-        for row in cells:
-            for cell in row:
-                if ct in ("all", "contents"):
-                    cell.value = None
-                if ct in ("all", "formats"):
-                    cell.font = Font()
-                    cell.fill = PatternFill()
-                    cell.border = Border()
-                    cell.alignment = Alignment()
-                    cell.number_format = "General"
-                    
-        wb.save(abs_path)
-        return {
-            "success": True,
-            "message": f"Successfully cleared {range_address or 'entire sheet'} ({ct}) in '{abs_path}'",
-            "filepath": abs_path,
-            "sheet": ws.title,
-            "range": range_address or "ALL"
-        }
+        try:
+            ws = cls._get_openpyxl_sheet(wb, sheet_name)
+
+            if range_address:
+                cells = ws[range_address]
+                if not isinstance(cells, tuple):
+                    cells = ((cells,),)
+                elif len(cells) > 0 and not isinstance(cells[0], tuple):
+                    cells = (cells,)
+            else:
+                cells = ws.iter_rows()
+
+            for row in cells:
+                for cell in row:
+                    if ct in ("all", "contents"):
+                        cell.value = None
+                    if ct in ("all", "formats"):
+                        cell.font = Font()
+                        cell.fill = PatternFill()
+                        cell.border = Border()
+                        cell.alignment = Alignment()
+                        cell.number_format = "General"
+
+            wb.save(abs_path)
+            return {
+                "success": True,
+                "message": f"Successfully cleared {range_address or 'entire sheet'} ({ct}) in '{abs_path}'",
+                "filepath": abs_path,
+                "sheet": ws.title,
+                "range": range_address or "ALL"
+            }
+        finally:
+            wb.close()
 
     @classmethod
     def add_chart(
@@ -990,22 +1200,38 @@ class ExcelEngine:
         sheet_name = parsed_sheet or sheet_name
         data_range = parsed_rng or "A1:B10"
 
-        # Try Live COM
-        if COM_AVAILABLE and not filepath:
+    @classmethod
+    def add_chart(
+        cls,
+        chart_type: str,
+        data_range: str,
+        title: Optional[str] = None,
+        x_axis_title: Optional[str] = None,
+        y_axis_title: Optional[str] = None,
+        position_cell: str = "E2",
+        width: int = 450,
+        height: int = 280,
+        filepath: Optional[str] = None,
+        sheet_name: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Insert a chart into a worksheet."""
+        chart_type_lower = chart_type.lower()
+        parsed_sheet, parsed_rng = split_sheet_and_range(data_range)
+        sheet_name = parsed_sheet or sheet_name
+        data_range = parsed_rng or "A1:B10"
+
+        app, wb, opened_in_live = cls._resolve_live_target(filepath=filepath, visible=True)
+        if wb is not None:
             try:
-                ensure_com()
-                app = LiveExcelSession.get_app(create_if_missing=False)
-                wb = LiveExcelSession.get_workbook(app, filepath)
                 ws = LiveExcelSession.get_sheet(wb, sheet_name)
-                
                 pos_rng = ws.Range(position_cell)
                 left = pos_rng.Left
                 top = pos_rng.Top
-                
+
                 chart_shape = ws.Shapes.AddChart2(201, 51, left, top, width, height)
                 chart = chart_shape.Chart
                 chart.SetSourceData(ws.Range(data_range))
-                
+
                 com_chart_types = {
                     "column_clustered": 51,
                     "column": 51,
@@ -1019,138 +1245,163 @@ class ExcelEngine:
                 }
                 if chart_type_lower in com_chart_types:
                     chart.ChartType = com_chart_types[chart_type_lower]
-                
+
                 if title:
                     chart.HasTitle = True
                     chart.ChartTitle.Text = title
-                    
+
                 if x_axis_title:
                     try:
                         chart.Axes(1).HasTitle = True
                         chart.Axes(1).AxisTitle.Text = x_axis_title
                     except Exception:
                         pass
-                        
+
                 if y_axis_title:
                     try:
                         chart.Axes(2).HasTitle = True
                         chart.Axes(2).AxisTitle.Text = y_axis_title
                     except Exception:
                         pass
-                        
-                return {
+
+                res = {
                     "success": True,
                     "message": f"Added {chart_type} chart at {position_cell} in live Excel ({ws.Name})",
                     "sheet": ws.Name,
                     "position": position_cell,
                     "title": title
                 }
-            except Exception as e:
-                if not filepath:
-                    raise e
+                if opened_in_live:
+                    cls._finalize_live_wb(app, wb, True, save_changes=True)
+                return res
+            except Exception:
+                cls._finalize_live_wb(app, wb, opened_in_live, save_changes=False)
+                raise
 
-        # File-based via openpyxl
         if not filepath:
             raise ValueError("Filepath required when Excel application is not running.")
-            
-        abs_path = os.path.abspath(filepath)
-        wb = openpyxl.load_workbook(abs_path)
-        ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
-        
-        if "bar" in chart_type_lower:
-            chart = BarChart()
-            chart.type = "bar"
-        elif "line" in chart_type_lower:
-            chart = LineChart()
-        elif "pie" in chart_type_lower:
-            chart = PieChart()
-        elif "area" in chart_type_lower:
-            chart = AreaChart()
-        else:
-            chart = BarChart()
-            chart.type = "col"
-            
-        if title:
-            chart.title = title
-        if x_axis_title and hasattr(chart, 'x_axis'):
-            chart.x_axis.title = x_axis_title
-        if y_axis_title and hasattr(chart, 'y_axis'):
-            chart.y_axis.title = y_axis_title
-            
-        # Parse range coords
-        min_col, min_row, max_col, max_row = openpyxl.utils.cell.range_boundaries(data_range)
-        has_header = (max_row > min_row)
 
-        if max_col > min_col:
-            # First column is categories, subsequent columns are data series
-            data_ref = Reference(ws, min_col=min_col + 1, min_row=min_row, max_col=max_col, max_row=max_row)
-            cats_ref = Reference(ws, min_col=min_col, min_row=min_row + 1 if has_header else min_row, max_row=max_row)
-            chart.add_data(data_ref, titles_from_data=has_header)
-            chart.set_categories(cats_ref)
-        else:
-            # Single-column data range: use entire column as data series
-            data_ref = Reference(ws, min_col=min_col, min_row=min_row, max_col=max_col, max_row=max_row)
-            chart.add_data(data_ref, titles_from_data=has_header)
-        
-        chart.width = width / 28.34  # convert approx pt to cm
-        chart.height = height / 28.34
-        
-        ws.add_chart(chart, position_cell)
-        wb.save(abs_path)
-        
-        return {
-            "success": True,
-            "message": f"Added {chart_type} chart at {position_cell} in '{abs_path}' (Sheet: '{ws.title}')",
-            "filepath": abs_path,
-            "sheet": ws.title,
-            "position": position_cell
-        }
+        abs_path = os.path.abspath(filepath)
+        if not os.path.exists(abs_path):
+            raise FileNotFoundError(f"File not found: {abs_path}")
+
+        wb = openpyxl.load_workbook(abs_path)
+        try:
+            ws = cls._get_openpyxl_sheet(wb, sheet_name)
+
+            min_col, min_row, max_col, max_row = openpyxl.utils.cell.range_boundaries(data_range)
+            has_header = (max_row > min_row)
+
+            if "scatter" in chart_type_lower:
+                if max_col <= min_col:
+                    raise ValueError("Scatter chart requires at least 2 columns (X and Y values).")
+                chart = ScatterChart()
+                x_ref = Reference(ws, min_col=min_col, min_row=min_row + 1 if has_header else min_row, max_row=max_row)
+                for col_idx in range(min_col + 1, max_col + 1):
+                    y_ref = Reference(ws, min_col=col_idx, min_row=min_row, max_row=max_row)
+                    chart.series.append(Series(y_ref, x_ref, title_from_data=has_header))
+            else:
+                if "doughnut" in chart_type_lower:
+                    chart = DoughnutChart()
+                elif "bar" in chart_type_lower:
+                    chart = BarChart()
+                    chart.type = "bar"
+                elif "line" in chart_type_lower:
+                    chart = LineChart()
+                elif "pie" in chart_type_lower:
+                    chart = PieChart()
+                elif "area" in chart_type_lower:
+                    chart = AreaChart()
+                else:
+                    chart = BarChart()
+                    chart.type = "col"
+
+                if max_col > min_col:
+                    data_ref = Reference(ws, min_col=min_col + 1, min_row=min_row, max_col=max_col, max_row=max_row)
+                    cats_ref = Reference(ws, min_col=min_col, min_row=min_row + 1 if has_header else min_row, max_row=max_row)
+                    chart.add_data(data_ref, titles_from_data=has_header)
+                    chart.set_categories(cats_ref)
+                else:
+                    data_ref = Reference(ws, min_col=min_col, min_row=min_row, max_col=max_col, max_row=max_row)
+                    chart.add_data(data_ref, titles_from_data=has_header)
+
+            if title:
+                chart.title = title
+            if x_axis_title and hasattr(chart, 'x_axis') and chart.x_axis is not None:
+                chart.x_axis.title = x_axis_title
+            if y_axis_title and hasattr(chart, 'y_axis') and chart.y_axis is not None:
+                chart.y_axis.title = y_axis_title
+
+            chart.width = width / 28.34  # convert approx pt to cm
+            chart.height = height / 28.34
+
+            ws.add_chart(chart, position_cell)
+            wb.save(abs_path)
+
+            return {
+                "success": True,
+                "message": f"Added {chart_type} chart at {position_cell} in '{abs_path}' (Sheet: '{ws.title}')",
+                "filepath": abs_path,
+                "sheet": ws.title,
+                "position": position_cell
+            }
+        finally:
+            wb.close()
 
     @classmethod
     def add_sheet(cls, sheet_name: str, filepath: Optional[str] = None) -> Dict[str, Any]:
         """Add a new worksheet to the workbook."""
-        if COM_AVAILABLE and not filepath:
+        app, wb, opened_in_live = cls._resolve_live_target(filepath=filepath, visible=True)
+        if wb is not None:
             try:
-                ensure_com()
-                app = LiveExcelSession.get_app(create_if_missing=False)
-                wb = LiveExcelSession.get_workbook(app, filepath)
+                existing_names = {s.Name.lower() for s in wb.Sheets}
+                if sheet_name.lower() in existing_names:
+                    raise ValueError(f"Sheet '{sheet_name}' already exists in workbook.")
                 ws = wb.Sheets.Add(After=wb.Sheets(wb.Sheets.Count))
                 ws.Name = sheet_name
-                return {
+                res = {
                     "success": True,
                     "message": f"Added worksheet '{sheet_name}' in live Excel workbook '{wb.Name}'.",
                     "sheet_name": sheet_name,
                     "workbook": wb.Name
                 }
-            except Exception as e:
-                if not filepath:
-                    raise e
-                    
+                if opened_in_live:
+                    cls._finalize_live_wb(app, wb, True, save_changes=True)
+                return res
+            except Exception:
+                cls._finalize_live_wb(app, wb, opened_in_live, save_changes=False)
+                raise
+
         if not filepath:
             raise ValueError("Filepath required when Excel application is not running.")
-            
+
         abs_path = os.path.abspath(filepath)
+        if not os.path.exists(abs_path):
+            raise FileNotFoundError(f"File not found: {abs_path}")
+
         wb = openpyxl.load_workbook(abs_path)
-        if sheet_name in wb.sheetnames:
-            raise ValueError(f"Sheet '{sheet_name}' already exists in workbook.")
-        ws = wb.create_sheet(title=sheet_name)
-        wb.save(abs_path)
-        return {
-            "success": True,
-            "message": f"Added worksheet '{sheet_name}' to '{abs_path}'.",
-            "sheet_name": sheet_name,
-            "filepath": abs_path
-        }
+        try:
+            if sheet_name in wb.sheetnames:
+                raise ValueError(f"Sheet '{sheet_name}' already exists in workbook.")
+            wb.create_sheet(title=sheet_name)
+            wb.save(abs_path)
+            return {
+                "success": True,
+                "message": f"Added worksheet '{sheet_name}' to '{abs_path}'.",
+                "sheet_name": sheet_name,
+                "filepath": abs_path
+            }
+        finally:
+            wb.close()
 
     @classmethod
     def list_sheets(cls, filepath: Optional[str] = None) -> Dict[str, Any]:
         """List all sheets and dimensions."""
-        if COM_AVAILABLE and not filepath:
+        app, wb, opened_in_live = cls._resolve_live_target(filepath=filepath, visible=True)
+        if wb is not None:
             try:
-                ensure_com()
-                app = LiveExcelSession.get_app(create_if_missing=False)
-                wb = LiveExcelSession.get_workbook(app, filepath)
                 sheets_info = []
+                active_name = wb.ActiveSheet.Name if wb.ActiveSheet else None
                 for s in wb.Sheets:
                     used = s.UsedRange
                     sheets_info.append({
@@ -1158,36 +1409,41 @@ class ExcelEngine:
                         "used_range": used.Address.replace('$', ''),
                         "rows": used.Rows.Count,
                         "cols": used.Columns.Count,
-                        "is_active": (s.Name == wb.ActiveSheet.Name)
+                        "is_active": (s.Name == active_name)
                     })
                 return {
                     "workbook": wb.Name,
                     "sheets_count": len(sheets_info),
                     "sheets": sheets_info
                 }
-            except Exception as e:
-                if not filepath:
-                    raise e
-                    
+            finally:
+                cls._finalize_live_wb(app, wb, opened_in_live, save_changes=False)
+
         if not filepath:
             raise ValueError("Filepath required when Excel application is not running.")
-            
+
         abs_path = os.path.abspath(filepath)
+        if not os.path.exists(abs_path):
+            raise FileNotFoundError(f"File not found: {abs_path}")
+
         wb = openpyxl.load_workbook(abs_path, read_only=True)
-        sheets_info = []
-        for name in wb.sheetnames:
-            ws = wb[name]
-            sheets_info.append({
-                "name": name,
-                "used_range": f"A1:{get_column_letter(ws.max_column or 1)}{ws.max_row or 1}",
-                "rows": ws.max_row or 0,
-                "cols": ws.max_column or 0
-            })
-        return {
-            "filepath": abs_path,
-            "sheets_count": len(sheets_info),
-            "sheets": sheets_info
-        }
+        try:
+            sheets_info = []
+            for name in wb.sheetnames:
+                ws = wb[name]
+                sheets_info.append({
+                    "name": name,
+                    "used_range": f"A1:{get_column_letter(ws.max_column or 1)}{ws.max_row or 1}",
+                    "rows": ws.max_row or 0,
+                    "cols": ws.max_column or 0
+                })
+            return {
+                "filepath": abs_path,
+                "sheets_count": len(sheets_info),
+                "sheets": sheets_info
+            }
+        finally:
+            wb.close()
 
     @classmethod
     def export_pdf(
@@ -1198,63 +1454,120 @@ class ExcelEngine:
         orientation: str = "landscape"
     ) -> Dict[str, Any]:
         """Export worksheet or entire workbook to PDF."""
+        if get_mode() == "headless":
+            raise LiveExcelError("PDF Export via Excel COM is disabled when EXCEL_MCP_MODE='headless'.")
         if not COM_AVAILABLE:
             raise RuntimeError("PDF Export via Excel requires Microsoft Excel and pywin32.")
-            
+
         abs_pdf = os.path.abspath(output_pdf_path)
         os.makedirs(os.path.dirname(abs_pdf), exist_ok=True)
-        
-        ensure_com()
-        app = LiveExcelSession.get_app(create_if_missing=True, visible=False)
-        wb = LiveExcelSession.get_workbook(app, filepath)
-        
-        target = wb
-        if sheet_name:
-            target = LiveExcelSession.get_sheet(wb, sheet_name)
-            
-        # Page orientation: xlLandscape = 2, xlPortrait = 1
+
+        app = None
+        wb = None
+        was_running = False
+        opened_temp_wb = False
+
+        active_app = LiveExcelSession.try_get_active_app()
+        if active_app is not None:
+            was_running = True
+            app = active_app
+        else:
+            if filepath and not os.path.exists(os.path.abspath(filepath)):
+                raise FileNotFoundError(f"File not found: {os.path.abspath(filepath)}")
+            app = LiveExcelSession.get_app(create_if_missing=True, visible=False)
+
         try:
-            target.PageSetup.Orientation = 2 if orientation.lower() == "landscape" else 1
-        except Exception:
-            pass
-            
-        # xlTypePDF = 0
-        target.ExportAsFixedFormat(0, abs_pdf)
-        
-        return {
-            "success": True,
-            "message": f"Successfully exported to PDF at '{abs_pdf}'",
-            "pdf_path": abs_pdf
-        }
+            if filepath:
+                existing_wb = LiveExcelSession.find_open_workbook(app, filepath)
+                if existing_wb is not None:
+                    wb = existing_wb
+                else:
+                    abs_path = os.path.abspath(filepath)
+                    if not os.path.exists(abs_path):
+                        raise FileNotFoundError(f"File not found: {abs_path}")
+                    wb = com_retry(app.Workbooks.Open, abs_path, ReadOnly=True)
+                    opened_temp_wb = True
+            else:
+                wb = LiveExcelSession.get_workbook(app, None)
+
+            orient_val = 2 if orientation.lower() == "landscape" else 1
+            if sheet_name:
+                target = LiveExcelSession.get_sheet(wb, sheet_name)
+                try:
+                    target.PageSetup.Orientation = orient_val
+                except Exception:
+                    pass
+            else:
+                target = wb
+                for s in wb.Sheets:
+                    try:
+                        s.PageSetup.Orientation = orient_val
+                    except Exception:
+                        pass
+
+            # xlTypePDF = 0
+            target.ExportAsFixedFormat(0, abs_pdf)
+
+            return {
+                "success": True,
+                "message": f"Successfully exported to PDF at '{abs_pdf}'",
+                "pdf_path": abs_pdf
+            }
+        finally:
+            if opened_temp_wb and wb is not None:
+                cls._finalize_live_wb(app, wb, True, save_changes=False)
+            if not was_running and app is not None:
+                try:
+                    app.DisplayAlerts = False
+                except Exception:
+                    pass
+                try:
+                    app.Quit()
+                except Exception:
+                    pass
 
     @classmethod
     def save_workbook(cls, save_as_path: Optional[str] = None, filepath: Optional[str] = None) -> Dict[str, Any]:
         """Save active or specified workbook."""
-        if COM_AVAILABLE and not filepath:
+        app, wb, opened_in_live = cls._resolve_live_target(filepath=filepath, visible=True)
+        if wb is not None:
             try:
-                ensure_com()
-                app = LiveExcelSession.get_app(create_if_missing=False)
-                wb = LiveExcelSession.get_workbook(app, filepath)
                 if save_as_path:
                     abs_save = os.path.abspath(save_as_path)
                     os.makedirs(os.path.dirname(abs_save), exist_ok=True)
-                    wb.SaveAs(abs_save)
+                    prev_alerts = getattr(app, "DisplayAlerts", None)
+                    try:
+                        if prev_alerts is not None:
+                            app.DisplayAlerts = False
+                        wb.SaveAs(abs_save)
+                    finally:
+                        if prev_alerts is not None:
+                            try:
+                                app.DisplayAlerts = prev_alerts
+                            except Exception:
+                                pass
                     return {"success": True, "message": f"Workbook saved as '{abs_save}'", "filepath": abs_save}
                 else:
                     wb.Save()
                     return {"success": True, "message": f"Workbook '{wb.Name}' saved successfully.", "filepath": wb.FullName}
-            except Exception as e:
-                if not filepath:
-                    raise e
+            finally:
+                cls._finalize_live_wb(app, wb, opened_in_live, save_changes=False)
                     
         if not filepath:
             raise ValueError("Filepath is required when Excel application is not running.")
             
         abs_path = os.path.abspath(filepath)
+        if not os.path.exists(abs_path):
+            raise FileNotFoundError(f"File not found: {abs_path}")
+
         target = os.path.abspath(save_as_path) if save_as_path else abs_path
+        os.makedirs(os.path.dirname(target), exist_ok=True)
         wb = openpyxl.load_workbook(abs_path)
-        wb.save(target)
-        return {"success": True, "message": f"Saved file to '{target}'", "filepath": target}
+        try:
+            wb.save(target)
+            return {"success": True, "message": f"Saved file to '{target}'", "filepath": target}
+        finally:
+            wb.close()
 
     @classmethod
     def analyze_sheet(
@@ -1292,7 +1605,9 @@ class ExcelEngine:
                     numeric_vals.append(float(v))
                 elif isinstance(v, str):
                     try:
-                        numeric_vals.append(float(v.replace(',', '').replace('$', '').replace('%', '')))
+                        parsed_num = float(v.strip().replace(',', '').replace('$', '').replace('%', ''))
+                        if math.isfinite(parsed_num):
+                            numeric_vals.append(parsed_num)
                     except Exception:
                         pass
                         
@@ -1331,20 +1646,25 @@ class ExcelEngine:
     @classmethod
     def execute_script(cls, code: str, filepath: Optional[str] = None) -> Dict[str, Any]:
         """Execute arbitrary Python code with injected Excel and openpyxl contexts."""
+        if os.environ.get("EXCEL_MCP_ENABLE_SCRIPT", "").strip().lower() in ("0", "false", "no", "off"):
+            raise PermissionError("excel_execute_script is disabled by EXCEL_MCP_ENABLE_SCRIPT.")
+
         app = None
         wb = None
         ws = None
-        
-        if COM_AVAILABLE:
+
+        if COM_AVAILABLE and get_mode() != "headless":
             try:
-                ensure_com()
-                app = LiveExcelSession.get_app(create_if_missing=False)
-                if app:
-                    wb = LiveExcelSession.get_workbook(app, filepath)
+                app = LiveExcelSession.try_get_active_app()
+                if app is not None:
+                    if filepath:
+                        wb = LiveExcelSession.find_open_workbook(app, filepath)
+                    elif app.Workbooks.Count > 0:
+                        wb = app.ActiveWorkbook
                     ws = wb.ActiveSheet if wb else None
             except Exception:
                 pass
-                
+
         local_vars = {
             "app": app,
             "wb": wb,
@@ -1355,11 +1675,10 @@ class ExcelEngine:
         }
         if COM_AVAILABLE:
             local_vars["win32com"] = win32com
-            
-        # Capture stdout safely using contextlib
+
         import io
         import contextlib
-        
+
         stdout_buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(stdout_buf):
@@ -1369,7 +1688,7 @@ class ExcelEngine:
                 "success": True,
                 "output": stdout_content.strip() or "Script executed successfully with no stdout output."
             }
-        except Exception as e:
+        except (Exception, SystemExit) as e:
             return {
                 "success": False,
                 "error": str(e),
@@ -1381,13 +1700,18 @@ class ExcelEngine:
         """Helper to format 2D matrix as Markdown table."""
         if not matrix:
             return ""
+        def _fmt_cell(val: Any) -> str:
+            if val is None:
+                return ""
+            return str(val).replace("|", "\\|").replace("\r\n", "<br>").replace("\n", "<br>")
+
         headers = matrix[0]
         rows = matrix[1:]
-        
-        header_line = "| " + " | ".join(str(h if h is not None else "") for h in headers) + " |"
+
+        header_line = "| " + " | ".join(_fmt_cell(h) for h in headers) + " |"
         sep_line = "| " + " | ".join("---" for _ in headers) + " |"
-        row_lines = ["| " + " | ".join(str(c if c is not None else "") for c in row) + " |" for row in rows]
-        
+        row_lines = ["| " + " | ".join(_fmt_cell(c) for c in row) + " |" for row in rows]
+
         return "\n".join([header_line, sep_line] + row_lines)
 
 

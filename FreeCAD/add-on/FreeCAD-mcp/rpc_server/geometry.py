@@ -18,19 +18,6 @@ import FreeCAD as App
 import FreeCADGui
 import ObjectsFem
 
-"""
-FreeCAD MCP Add-on: Geometry & Modeling Engine
-=============================================
-Consolidates object validation, property mapping, object factory,
-geometry serialization, and parts library access.
-"""
-
-
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-
-import ObjectsFem
-
 # ---------------------------------------------------------------------
 # 1. Object Validity Verification
 # ---------------------------------------------------------------------

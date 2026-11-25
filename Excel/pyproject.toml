@@ -44,6 +44,9 @@ dependencies = [
 [project.scripts]
 excel-mcp = "excel_mcp_servers:main"
 
+[tool.setuptools]
+py-modules = ["excel_mcp_servers"]
+
 [project.urls]
 Homepage = "https://github.com/example/excel-mcp-server"
 Repository = "https://github.com/example/excel-mcp-server.git"

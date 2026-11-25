@@ -55,4 +55,4 @@ word-mcp = "word_mcp_servers:main"
 py-modules = ["word_mcp_servers"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["../Tests"]

@@ -271,6 +271,27 @@ print("CAD_PIPELINE_COMPLETE")
         self.assertIsNotNone(rejection_host)
         self.assertEqual(rejection_host[0], 403)
 
+        handler_ipv6_loopback = FakeHandler({"Host": "[::1]:2608"})
+        self.assertIsNone(FreeCADBridgeHTTPHandler._verify_request(handler_ipv6_loopback))
+
+    def test_validation_and_quote_escaping_guards(self):
+        """Verify create_document escaping, list_documents error reporting, and animation guards."""
+        import json
+        from unittest import mock
+        with mock.patch.object(freecad_mcp_server, "get_freecad_connection", side_effect=RuntimeError("no rpc")), \
+             mock.patch.object(FreeCADEngine, "execute_code", return_value={"success": False, "error": "no runtime"}) as mock_exec:
+            res_create = freecad_mcp_server.create_document("Part's \"Test\"")
+            self.assertIn("Error creating document", res_create[0].text)
+            called_code = mock_exec.call_args[0][0]
+            self.assertIn(json.dumps("Part's \"Test\""), called_code)
+            compile(called_code, "<test>", "exec")
+
+            res_list = freecad_mcp_server.list_documents()
+            self.assertIn("Error listing documents", res_list[0].text)
+
+        res_anim = freecad_mcp_server.freecad_animate_mechanism(fps=0, duration_seconds=1.0)
+        self.assertIn("positive numbers", res_anim[0].text)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

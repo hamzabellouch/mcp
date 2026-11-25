@@ -235,6 +235,68 @@ class TestBlenderMCPMockedOnline(unittest.TestCase):
         )
         self.assertTrue(mock_requests_get.called)
         self.assertTrue(mock_send.called)
+        sent_code = mock_send.call_args[1]["payload"]["code"]
+        imported_file = [line.split(" = ", 1)[1] for line in sent_code.splitlines() if line.startswith("filepath = ")][0]
+        import json as _json
+        self.assertFalse(os.path.exists(_json.loads(imported_file)))
+
+    @patch("blender_mcp_server._send_request")
+    def test_primitive_transforms_material_nodes_and_failure_status(self, mock_send):
+        mock_send.return_value = {"success": True, "stdout": "OK", "stderr": "", "error": None}
+        for ptype in ("torus", "light", "camera"):
+            blender_create_primitive(ptype, rotation=[0.1, 0.2, 0.3], scale=[2.0, 2.0, 2.0])
+            code = mock_send.call_args[1]["payload"]["code"]
+            self.assertIn("active_object.scale = [2.0, 2.0, 2.0]", code)
+            if ptype == "light":
+                self.assertIn("rotation=[0.1, 0.2, 0.3]", code)
+
+        blender_assign_material("Cube", material_name="ExistingNoNodes")
+        mat_code = mock_send.call_args[1]["payload"]["code"]
+        self.assertIn("if not mat.use_nodes:", mat_code)
+
+        # success=False without truthy 'error' must still report failure cleanly
+        mock_send.return_value = {"success": False, "stderr": "Runtime crash"}
+        exec_res = blender_execute_script("print(1)")
+        self.assertIn("Execution Failed", exec_res)
+        self.assertIn("Runtime crash", exec_res)
+
+        mock_send.return_value = {"success": False}
+        self.assertIn("Render failed", blender_render_image())
+        self.assertIn("Error clearing scene", blender_clear_scene())
+
+    def test_addon_ipv6_host_and_system_exit_and_bad_content_length(self):
+        import types
+        import importlib.util
+        fake_bpy = types.ModuleType("bpy")
+        fake_bpy.types = types.SimpleNamespace(Operator=object, Panel=object, Scene=types.SimpleNamespace())
+        fake_bpy.props = types.SimpleNamespace(StringProperty=lambda **kw: None, IntProperty=lambda **kw: None)
+        fake_bpy.utils = types.SimpleNamespace(register_class=lambda c: None, unregister_class=lambda c: None)
+        fake_bpy.app = types.SimpleNamespace(timers=types.SimpleNamespace(is_registered=lambda fn: False, register=lambda fn, persistent=False: None, unregister=lambda fn: None), version_string="4.2.0")
+        fake_bpy.context = types.SimpleNamespace(scene=types.SimpleNamespace(objects=[]), active_object=None)
+        fake_bpy.data = types.SimpleNamespace()
+        fake_bpy.ops = types.SimpleNamespace()
+
+        addon_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Blender", "Add-on", "blender_addon.py"))
+        with patch.dict(sys.modules, {"bpy": fake_bpy}):
+            spec = importlib.util.spec_from_file_location("blender_addon_test_mod", addon_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+
+            res = mod.execute_code_in_main_thread("import sys; sys.exit(3)")
+            self.assertFalse(res["success"])
+            self.assertIn("SystemExit", res["error"])
+
+            handler = mod.MCPBridgeHandler.__new__(mod.MCPBridgeHandler)
+            handler.client_address = ("::1", 50000)
+            handler.headers = {"Host": "[::1]:9876"}
+            ok, status, _ = handler._is_authorized()
+            self.assertTrue(ok)
+            self.assertEqual(status, 200)
+
+            handler.headers = {"Host": "evil.example:9876"}
+            ok2, status2, _ = handler._is_authorized()
+            self.assertFalse(ok2)
+            self.assertEqual(status2, 400)
 
 
 class TestFastMCPIntegration(unittest.TestCase):
